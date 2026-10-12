@@ -1,4 +1,4 @@
-"""MEXC Breakout Radar v2.0 — research, paper simulation, and in-app alerts only."""
+"""MEXC Breakout Radar v2.0.1 — research, paper simulation, and in-app alerts only."""
 import json
 import math
 import sqlite3
@@ -11,7 +11,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="MEXC Breakout Radar v2.0", page_icon="📡", layout="wide")
+st.set_page_config(page_title="MEXC Breakout Radar v2.0.1", page_icon="📡", layout="wide")
 BASE = "https://api.mexc.com"
 TIMEOUT = 12
 DB = Path("radar_paper.sqlite3")
@@ -29,10 +29,28 @@ def safe_float(v, default=float("nan")):
         return default
 
 
+class MarketDataHTTPError(RuntimeError):
+    def __init__(self, status, endpoint, detail="", retry_after=""):
+        self.status = status
+        self.endpoint = endpoint
+        self.retry_after = retry_after
+        super().__init__(f"HTTP {status} | {endpoint} | {detail[:180]}" + (f" | Retry-After: {retry_after}s" if retry_after else ""))
+
+
 def get_json(path, params=None):
-    r = requests.get(BASE + path, params=params, timeout=TIMEOUT, headers={"User-Agent": "MEXC-Radar-Research/2.0"})
-    r.raise_for_status()
-    return r.json()
+    # No API keys, no retries on 403/418/429, no full URL or secret logging.
+    try:
+        r = requests.get(BASE + path, params=params, timeout=TIMEOUT,
+                         headers={"User-Agent": "MEXC-Radar-Research/2.0.1", "Accept": "application/json"})
+    except requests.RequestException as e:
+        raise RuntimeError(f"Błąd sieci {path}: {type(e).__name__}: {str(e)[:160]}") from e
+    if not r.ok:
+        detail = r.text[:180].replace("\n", " ").replace("\r", " ")
+        raise MarketDataHTTPError(r.status_code, path, detail, r.headers.get("Retry-After", ""))
+    try:
+        return r.json()
+    except ValueError as e:
+        raise RuntimeError(f"Odpowiedź nie jest JSON: {path}, HTTP {r.status_code}") from e
 
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -217,7 +235,7 @@ def paper_update():
         con.close()
 
 
-st.title("📡 MEXC Breakout Radar v2.0")
+st.title("📡 MEXC Breakout Radar v2.0.1")
 st.caption("Badanie setupów futures LONG • osobne grupy 3–49 i 50+ dni • symulacje i alerty w aplikacji • bez zleceń")
 st.warning("Nie ma gwarancji zysków. Sygnały są heurystyczne, a symulacje używają świec spot jako przybliżenia ruchu futures. Bez kluczy API i bez realnego handlu.")
 
@@ -252,6 +270,7 @@ with scan_tab:
             futs = futs[:limit]
             found = []
             errors = []
+            blocked = None
             bar = st.progress(0)
             for i, (_, f) in enumerate(futs):
                 symbol = str(f["symbol"]).replace("_", "")
@@ -265,24 +284,36 @@ with scan_tab:
                     if result and result["score"] >= min_score:
                         result["wiek_danych"] = age_note
                         found.append(result)
+                except MarketDataHTTPError as e:
+                    errors.append(f"{symbol}: {e}")
+                    if e.status in (403, 418, 429, 451):
+                        blocked = str(e)
+                        break
                 except Exception as e:
-                    errors.append(f"{symbol}: {type(e).__name__}")
+                    errors.append(f"{symbol}: {type(e).__name__}: {str(e)[:160]}")
                 finally:
                     bar.progress((i + 1) / max(1, len(futs)))
             bar.empty()
             st.session_state["results"] = found
+            st.session_state["scan_blocked"] = blocked
+            if blocked:
+                st.error("DANE NIEDOSTĘPNE — MEXC odrzucił żądanie. Skan przerwany, aby nie powtarzać blokowanych zapytań. " + blocked)
             st.info(f"Sprawdzono {len(futs)} kontraktów. Kandydatów: {len(found)}. Błędy danych: {len(errors)}.")
             if errors:
                 with st.expander("Błędy pobierania danych"):
                     st.write(errors[:25])
         except Exception as e:
-            st.error(f"Skanowanie nie powiodło się: {e}")
+            st.session_state["scan_blocked"] = str(e)
+            st.error(f"DANE NIEDOSTĘPNE — skanowanie nie powiodło się: {e}")
     results = st.session_state.get("results", [])
     for cohort in ["3–49 dni", "50+ dni"]:
         st.markdown(f"### {'🆕' if cohort.startswith('3') else '🏛️'} {cohort}")
         group = sorted([x for x in results if x["group"] == cohort], key=lambda x: x["score"], reverse=True)
         if not group:
-            st.info("BRAK SYGNAŁU w tej grupie przy aktualnych ustawieniach.")
+            if st.session_state.get("scan_blocked"):
+                st.error("DANE NIEDOSTĘPNE — nie można ocenić tej grupy.")
+            else:
+                st.info("BRAK SYGNAŁU w tej grupie przy aktualnych ustawieniach.")
             continue
         cols = ["symbol", "score", "status", "entry", "stop", "target", "volume_ratio", "spread_pct", "funding_pct", "wiek_danych"]
         st.dataframe(pd.DataFrame(group)[cols], use_container_width=True, hide_index=True)
