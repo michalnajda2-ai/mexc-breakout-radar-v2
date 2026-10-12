@@ -1,4 +1,4 @@
-"""MEXC Breakout Radar v2.0.1 — research, paper simulation, and in-app alerts only."""
+"""MEXC Breakout Radar v2.0.2 — research, paper simulation, and in-app alerts only."""
 import json
 import math
 import sqlite3
@@ -11,7 +11,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="MEXC Breakout Radar v2.0.1", page_icon="📡", layout="wide")
+st.set_page_config(page_title="MEXC Breakout Radar v2.0.2", page_icon="📡", layout="wide")
 BASE = "https://api.mexc.com"
 TIMEOUT = 12
 DB = Path("radar_paper.sqlite3")
@@ -71,7 +71,9 @@ def futures_tickers():
 
 
 @st.cache_data(ttl=120, show_spinner=False)
-def candles(symbol, interval="1h", limit=200):
+def candles(symbol, interval="60m", limit=200):
+    # MEXC Spot uses 60m for hourly candles; 1h yields HTTP 400 / -1121.
+    interval = {"1h": "60m", "1H": "60m", "4H": "4h"}.get(interval, interval)
     data = get_json("/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": limit})
     if not isinstance(data, list) or not data:
         return pd.DataFrame()
@@ -235,7 +237,7 @@ def paper_update():
         con.close()
 
 
-st.title("📡 MEXC Breakout Radar v2.0.1")
+st.title("📡 MEXC Breakout Radar v2.0.2")
 st.caption("Badanie setupów futures LONG • osobne grupy 3–49 i 50+ dni • symulacje i alerty w aplikacji • bez zleceń")
 st.warning("Nie ma gwarancji zysków. Sygnały są heurystyczne, a symulacje używają świec spot jako przybliżenia ruchu futures. Bez kluczy API i bez realnego handlu.")
 
@@ -258,6 +260,8 @@ with scan_tab:
     st.subheader("Młode (3–49 dni) i starsze (50+ dni)")
     st.caption("Ranking nie oznacza prawdopodobieństwa zysku. Status CZEKAJ nie jest sygnałem wejścia.")
     if scan:
+        st.session_state["results"] = []
+        st.session_state["scan_blocked"] = None
         try:
             raw = futures_tickers()
             futs = []
@@ -268,12 +272,19 @@ with scan_tab:
                     futs.append((turnover, f))
             futs.sort(key=lambda x: x[0], reverse=True)
             futs = futs[:limit]
+            # Futures symbols do not always have a matching MEXC spot market.
+            spot_symbols = {str(t.get("symbol", "")) for t in spot_tickers() if isinstance(t, dict)}
+            skipped_no_spot = 0
             found = []
             errors = []
             blocked = None
             bar = st.progress(0)
             for i, (_, f) in enumerate(futs):
                 symbol = str(f["symbol"]).replace("_", "")
+                if symbol not in spot_symbols:
+                    skipped_no_spot += 1
+                    bar.progress((i + 1) / max(1, len(futs)))
+                    continue
                 try:
                     age, age_note = age_from_spot_history(symbol)
                     if age is None or age < 3:
@@ -298,11 +309,15 @@ with scan_tab:
             st.session_state["scan_blocked"] = blocked
             if blocked:
                 st.error("DANE NIEDOSTĘPNE — MEXC odrzucił żądanie. Skan przerwany, aby nie powtarzać blokowanych zapytań. " + blocked)
-            st.info(f"Sprawdzono {len(futs)} kontraktów. Kandydatów: {len(found)}. Błędy danych: {len(errors)}.")
+            st.info(f"Sprawdzono {len(futs)} kontraktów. Kandydatów: {len(found)}. "
+                    f"Błędy danych: {len(errors)}. Bez odpowiednika spot: {skipped_no_spot}.")
+            if errors:
+                st.warning("Nie wszystkie kontrakty udało się przeanalizować. Brak kandydatów nie oznacza pełnego skanu rynku.")
             if errors:
                 with st.expander("Błędy pobierania danych"):
                     st.write(errors[:25])
         except Exception as e:
+            st.session_state["results"] = []
             st.session_state["scan_blocked"] = str(e)
             st.error(f"DANE NIEDOSTĘPNE — skanowanie nie powiodło się: {e}")
     results = st.session_state.get("results", [])
