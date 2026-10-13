@@ -1,4 +1,4 @@
-"""MEXC Breakout Radar v2.0.4 — research, paper simulation, and in-app alerts only."""
+"""MEXC Breakout Radar v2.0.5 — research, paper simulation, and in-app alerts only."""
 import json
 import math
 import sqlite3
@@ -11,9 +11,9 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="MEXC Breakout Radar v2.0.4", page_icon="📡", layout="wide")
+st.set_page_config(page_title="MEXC Breakout Radar v2.0.5", page_icon="📡", layout="wide")
 BASE = "https://api.mexc.com"
-FUTURES_BASE = "https://contract.mexc.com"
+FUTURES_BASE = "https://api.mexc.com"
 TIMEOUT = 12
 DB = Path("radar_paper.sqlite3")
 
@@ -42,7 +42,7 @@ def get_json(path, params=None, base=None):
     # No API keys, no retries on 403/418/429, no full URL or secret logging.
     try:
         r = requests.get((base or BASE) + path, params=params, timeout=TIMEOUT,
-                         headers={"User-Agent": "MEXC-Radar-Research/2.0.3", "Accept": "application/json"})
+                         headers={"User-Agent": "MEXC-Radar-Research/2.0.5", "Accept": "application/json"})
     except requests.RequestException as e:
         raise RuntimeError(f"Błąd sieci {path}: {type(e).__name__}: {str(e)[:160]}") from e
     if not r.ok:
@@ -158,102 +158,87 @@ def rsi14(close):
 
 
 def compute_signal(symbol, df, fut, cohort, min_turnover, max_spread, max_funding, daily=None):
-    """Separate trend strength from entry quality; hard risk gates override scores."""
-    if len(df) < 55 or daily is None or len(daily) < 30:
+    """Early-base watchlist. No momentum-chasing scores or future-return predictions."""
+    if len(df) < 65 or daily is None or len(daily) < 35:
         return None
     close = df.close.astype(float)
+    dclose = daily.close.astype(float)
     price = float(close.iloc[-1])
     if not np.isfinite(price) or price <= 0:
         return None
-    ema9 = close.ewm(span=9, adjust=False).mean()
-    ema21 = close.ewm(span=21, adjust=False).mean()
-    high20 = float(df.high.iloc[-21:-1].max())
-    q = df.quote_volume
-    prev = float(q.iloc[-25:-1].mean())
-    vol_ratio = float(q.iloc[-1] / prev) if prev > 0 else float("nan")
-    prev_close = close.shift(1)
-    tr = pd.concat([df.high-df.low, (df.high-prev_close).abs(), (df.low-prev_close).abs()], axis=1).max(axis=1)
-    atr = float(tr.tail(14).mean())
-    if not np.isfinite(atr) or atr <= 0:
-        return None
     bid, ask = safe_float(fut.get("bid1")), safe_float(fut.get("ask1"))
-    spread = (ask/bid-1)*100 if bid > 0 and ask >= bid else float("nan")
-    funding = safe_float(fut.get("fundingRate"))
-    turnover = safe_float(fut.get("amount24"))
+    spread = (ask / bid - 1) * 100 if bid > 0 and ask >= bid else float("nan")
+    funding, turnover = safe_float(fut.get("fundingRate")), safe_float(fut.get("amount24"))
     if not all(np.isfinite(x) for x in (spread, funding, turnover)):
         return None
-    if turnover < min_turnover or spread > max_spread or funding*100 > max_funding:
+    if turnover < min_turnover or spread > max_spread or funding * 100 > max_funding:
         return None
-    dclose = daily.close.astype(float)
-    daily_ema20 = float(dclose.ewm(span=20, adjust=False).mean().iloc[-1])
-    rsi = rsi14(dclose)
-    if not np.isfinite(rsi) or daily_ema20 <= 0:
-        return None
-    # 3d/7d return measured on CLOSED daily candles; unavailable history blocks readiness.
-    change3 = (float(dclose.iloc[-1]/dclose.iloc[-4])-1)*100 if len(dclose)>=4 else float("nan")
-    change7 = (float(dclose.iloc[-1]/dclose.iloc[-8])-1)*100 if len(dclose)>=8 else float("nan")
-    distance_ema = (price/daily_ema20-1)*100
-    trend = bool(ema9.iloc[-1]>ema21.iloc[-1] and price>ema21.iloc[-1] and dclose.iloc[-1]>daily_ema20)
-    breakout = bool(price>high20)
-    volume_ok = bool(np.isfinite(vol_ratio) and vol_ratio>=1.4)
-    # These are explicit heuristics, NOT probability estimates or backtested thresholds.
-    trend_score = (40 if trend else 0) + (30 if breakout else 0) + (20 if volume_ok else 0) + (10 if spread<0.15 else 0)
-    overheated = rsi >= 80 or change3 >= 30 or change7 >= 55 or distance_ema >= 25
-    warm = rsi >= 70 or change3 >= 15 or change7 >= 30 or distance_ema >= 12
-    entry_score = 100
-    reasons = []
-    if rsi >= 80:
-        entry_score -= 45; reasons.append(f"RSI 1D {rsi:.1f} ≥ 80")
-    elif rsi >= 70:
-        entry_score -= 20; reasons.append(f"RSI 1D {rsi:.1f} ≥ 70")
-    if change3 >= 30:
-        entry_score -= 35; reasons.append(f"wzrost 3D +{change3:.1f}% ≥ 30%")
-    elif change3 >= 15:
-        entry_score -= 15; reasons.append(f"wzrost 3D +{change3:.1f}% ≥ 15%")
-    if change7 >= 55:
-        entry_score -= 35; reasons.append(f"wzrost 7D +{change7:.1f}% ≥ 55%")
-    elif change7 >= 30:
-        entry_score -= 15; reasons.append(f"wzrost 7D +{change7:.1f}% ≥ 30%")
-    if distance_ema >= 25:
-        entry_score -= 35; reasons.append(f"cena {distance_ema:+.1f}% od EMA20 1D (≥25%)")
-    elif distance_ema >= 12:
-        entry_score -= 15; reasons.append(f"cena {distance_ema:+.1f}% od EMA20 1D (≥12%)")
-    if not trend:
-        entry_score -= 25; reasons.append("brak potwierdzonego trendu 1H/1D")
-    if not breakout:
-        entry_score -= 10; reasons.append("brak wybicia maksimum 20 świec 1H")
-    if not volume_ok:
-        entry_score -= 10; reasons.append(f"wolumen 1H {vol_ratio:.2f}×, wymagane ≥1.4×")
-    entry_score = max(0, min(100, entry_score))
-    if overheated:
-        status = "ODRZUCONY — PRZEGRZANY"
-    elif warm:
-        status = "CZEKAJ NA KOREKTĘ"
-    elif not trend or not breakout or not volume_ok:
-        status = "CZEKAJ NA POTWIERDZENIE"
-    elif entry_score < 75:
-        status = "CZEKAJ NA POTWIERDZENIE"
+    rsi_d = rsi14(dclose)
+    rsi_h = rsi14(close)
+    ema20 = float(dclose.ewm(span=20, adjust=False).mean().iloc[-1])
+    change3 = (float(dclose.iloc[-1] / dclose.iloc[-4]) - 1) * 100
+    change7 = (float(dclose.iloc[-1] / dclose.iloc[-8]) - 1) * 100
+    change24h = (price / float(close.iloc[-25]) - 1) * 100
+    distance_ema = (price / ema20 - 1) * 100
+    high20 = float(df.high.iloc[-21:-1].max())
+    base = df.iloc[-49:-1]
+    base_high, base_low = float(base.high.max()), float(base.low.min())
+    base_width = (base_high / base_low - 1) * 100 if base_low > 0 else float("inf")
+    recent_range = (float(df.high.iloc[-13:-1].max()) / float(df.low.iloc[-13:-1].min()) - 1) * 100
+    previous_range = (float(df.high.iloc[-37:-13].max()) / float(df.low.iloc[-37:-13].min()) - 1) * 100
+    contraction = recent_range < previous_range * 0.8 if previous_range > 0 else False
+    q = df.quote_volume.astype(float)
+    vol_base = float(q.iloc[-25:-1].mean())
+    vol_ratio = float(q.iloc[-1] / vol_base) if vol_base > 0 else float("nan")
+    ema9 = close.ewm(span=9, adjust=False).mean()
+    ema21 = close.ewm(span=21, adjust=False).mean()
+    rising = bool(ema9.iloc[-1] > ema21.iloc[-1] and ema21.iloc[-1] >= ema21.iloc[-5])
+    # Never rank a developed rally as an early-stage setup.
+    gates = []
+    if rsi_h >= 72: gates.append(f"RSI 1H {rsi_h:.1f} ≥ 72")
+    if rsi_d >= 70: gates.append(f"RSI 1D {rsi_d:.1f} ≥ 70")
+    if change24h >= 8: gates.append(f"wzrost 24H +{change24h:.1f}% ≥ 8%")
+    if change3 >= 12: gates.append(f"wzrost 3D +{change3:.1f}% ≥ 12%")
+    if change7 >= 22: gates.append(f"wzrost 7D +{change7:.1f}% ≥ 22%")
+    if distance_ema >= 9: gates.append(f"cena {distance_ema:+.1f}% od EMA20 1D ≥ 9%")
+    if price > high20 * 1.025: gates.append("wybicie >2.5% ponad wcześniejsze maksimum 20H")
+    # Pre-breakout: base under resistance, not a candle already racing away.
+    near_resistance = 0.96 * base_high <= price <= 1.012 * base_high
+    base_ok = base_width <= 14
+    daily_not_weak = 43 <= rsi_d < 70
+    early_volume = np.isfinite(vol_ratio) and 0.65 <= vol_ratio <= 2.5
+    features = {
+        "baza_48h": (base_ok, 25, f"baza 48H {base_width:.1f}% (cel ≤14%)"),
+        "kompresja": (contraction, 20, f"kompresja zmienności 12H/24H: {recent_range:.1f}% / {previous_range:.1f}%"),
+        "blisko_oporu": (near_resistance, 20, f"cena do oporu 48H: {(price/base_high-1)*100:+.1f}%"),
+        "wczesny_trend": (rising, 15, "EMA9 > EMA21 i EMA21 rośnie (1H)"),
+        "RSI_umiarkowane": (daily_not_weak, 10, f"RSI 1D {rsi_d:.1f} w przedziale 43–70"),
+        "wolumen": (early_volume, 10, f"wolumen ostatniej 1H {vol_ratio:.2f}× średniej"),
+    }
+    score = sum(weight for passed, weight, _ in features.values() if passed)
+    positives = [desc for passed, _, desc in features.values() if passed]
+    missing = [desc for passed, _, desc in features.values() if not passed]
+    if gates:
+        status = "ODRZUCONY — RAJD TRWA"
+    elif base_ok and near_resistance and contraction and rising and daily_not_weak and score >= 75:
+        status = "OBSERWUJ — PRZED WYBICIEM"
     else:
-        status = "GOTOWY DO OBSERWACJI"
-    if not reasons:
-        reasons.append("trend 1H/1D, wybicie i wolumen potwierdzone; bez progów przegrzania")
-    # No actionable entry/SL/TP for rejected or waiting setups.
-    entry = float(ask) if status == "GOTOWY DO OBSERWACJI" else None
-    stop = entry - 1.5*atr if entry is not None else None
-    target = entry + 2.0*(entry-stop) if entry is not None else None
-    if entry is not None and (stop <= 0 or (entry-stop)/entry*100 > 8):
-        status = "ODRZUCONY — RYZYKO"
-        reasons.append("stop-loss zbyt daleko (>8%) lub niepoprawny")
-        entry = stop = target = None
-    return {"symbol":symbol,"contract":str(fut.get("symbol")),"group":cohort,
-            "score":entry_score,"trend_score":trend_score,"entry_score":entry_score,
-            "status":status,"powod":"; ".join(reasons),"rsi_1d":round(rsi,1),
-            "zmiana_3d_pct":round(change3,1),"zmiana_7d_pct":round(change7,1),
-            "od_ema20_1d_pct":round(distance_ema,1),
-            "entry":entry,"stop":stop,"target":target,"spot_close":price,
-            "atr_pct":100*atr/price,"volume_ratio":vol_ratio,"spread_pct":spread,
-            "funding_pct":100*funding,"turnover":turnover,"trend":trend,"breakout":breakout,
-            "quote_time":utcnow().isoformat()}
+        status = "BRAK UKŁADU PRZED WYBICIEM"
+    # A watchlist is not an order signal: no actionable entry, stop or target.
+    return {"symbol": symbol, "contract": str(fut.get("symbol")), "group": cohort,
+            "score": score if not gates else 0, "entry_score": score if not gates else 0,
+            "trend_score": None, "status": status,
+            "powod": ("BLOKADA: " + "; ".join(gates) + ". " if gates else "") +
+                     "SPEŁNIONE: " + ("; ".join(positives) or "brak") +
+                     ". BRAKUJE: " + ("; ".join(missing) or "nic"),
+            "rsi_1d": round(rsi_d, 1), "rsi_1h": round(rsi_h, 1),
+            "zmiana_24h_pct": round(change24h, 1),
+            "zmiana_3d_pct": round(change3, 1), "zmiana_7d_pct": round(change7, 1),
+            "od_ema20_1d_pct": round(distance_ema, 1), "szerokosc_bazy_48h_pct": round(base_width, 1),
+            "entry": None, "stop": None, "target": None, "spot_close": price,
+            "volume_ratio": vol_ratio, "spread_pct": spread,
+            "funding_pct": funding * 100, "turnover": turnover,
+            "quote_time": utcnow().isoformat()}
 
 
 def db_connect():
@@ -351,9 +336,9 @@ def paper_update():
     return errors
 
 
-st.title("📡 MEXC Breakout Radar v2.0.4")
+st.title("📡 MEXC Breakout Radar v2.0.5")
 st.caption("Badanie setupów futures LONG • osobne grupy 3–49 i 50+ dni • symulacje i alerty w aplikacji • bez zleceń")
-st.warning("Brak gwarancji zysków. Oceny to nie prawdopodobieństwa; progi przegrzania nie są zweryfikowane backtestem. Analiza używa zamkniętych świec futures. Bez zleceń.")
+st.warning("Wersja eksperymentalna: szuka konsolidacji przed możliwym wybiciem, nie przewiduje rajdów. Brak sygnałów wejścia i nowych symulacji z listy. Bez zleceń.")
 
 with st.sidebar:
     st.header("⚙️ Ustawienia")
@@ -361,7 +346,7 @@ with st.sidebar:
     min_turnover = st.number_input("Min. obrót futures 24h (USDT)", min_value=0.0, value=1_000_000.0, step=250_000.0)
     max_spread = st.slider("Maksymalny spread (%)", 0.05, 2.0, 0.5, 0.05)
     max_funding = st.slider("Maksymalny funding dodatni (%)", 0.0, 0.5, 0.1, 0.01)
-    min_score = st.slider("Minimalna jakość wejścia do pokazania (odrzucone widoczne diagnostycznie)", 0, 100, 65, 5)
+    min_score = st.slider("Minimalna ocena bazy do listy obserwacyjnej", 0, 100, 65, 5)
     capital = st.number_input("Kapitał symulacyjny (USDT)", 100.0, 1_000_000.0, 1000.0, 100.0)
     risk_pct = st.slider("Ryzyko na pozycję (% kapitału)", 0.1, 2.0, 0.5, 0.1)
     fee_pct = st.number_input("Prowizja za jedną stronę (%)", 0.0, 1.0, 0.05, 0.01)
@@ -372,7 +357,7 @@ scan_tab, manual_tab, paper_tab, about_tab = st.tabs(["🔎 Dwa skanery", "🧪 
 
 with scan_tab:
     st.subheader("Młode (3–49 dni) i starsze (50+ dni)")
-    st.caption("Ocena wejścia ≠ prawdopodobieństwo zysku. ODRZUCONY i CZEKAJ nie są sygnałami wejścia. Progi są eksperymentalne.")
+    st.caption("Lista obserwacyjna PRZED wybiciem, nie sygnały transakcyjne. Rajdy i aktywa niekryptowalutowe są odrzucane. Progi eksperymentalne.")
     if scan:
         st.session_state["results"] = []
         st.session_state["scan_blocked"] = None
@@ -382,7 +367,12 @@ with scan_tab:
             for f in raw:
                 name = str(f.get("symbol", ""))
                 turnover = safe_float(f.get("amount24"))
-                if name.endswith("_USDT") and np.isfinite(turnover) and turnover >= min_turnover:
+                # Exclude stocks, leveraged ETFs, commodities and index proxies; ticker alone
+                # cannot classify every synthetic instrument, so also reject known families.
+                base_asset = name[:-5] if name.endswith("_USDT") else ""
+                banned = ("SOXS", "SOXL", "USOIL", "XAU", "XAG", "SILVER", "GOLD", "MUSTOCK", "TSLA", "NVDA", "AAPL", "SPY", "QQQ", "STOCK", "OIL")
+                if (name.endswith("_USDT") and not any(x in base_asset for x in banned)
+                        and np.isfinite(turnover) and turnover >= min_turnover):
                     futs.append((turnover, f))
             futs.sort(key=lambda x: x[0], reverse=True)
             futs = futs[:limit]
@@ -401,7 +391,7 @@ with scan_tab:
                     df = futures_candles(str(f["symbol"]), "Min60", 160)
                     daily = futures_candles(str(f["symbol"]), "Day1", 85)
                     result = compute_signal(symbol, df, f, cohort, min_turnover, max_spread, max_funding, daily=daily)
-                    if result and (result["score"] >= min_score or result["status"].startswith("ODRZUCONY")):
+                    if result and result["status"] == "OBSERWUJ — PRZED WYBICIEM" and result["score"] >= min_score:
                         result["wiek_danych"] = age_note
                         found.append(result)
                 except MarketDataHTTPError as e:
@@ -418,7 +408,7 @@ with scan_tab:
             st.session_state["scan_blocked"] = blocked
             if blocked:
                 st.error("DANE NIEDOSTĘPNE — MEXC odrzucił żądanie. Skan przerwany, aby nie powtarzać blokowanych zapytań. " + blocked)
-            st.info(f"Sprawdzono {len(futs)} kontraktów. Pokazanych ocen: {len(found)} (w tym odrzucone). "
+            st.info(f"Sprawdzono {len(futs)} kontraktów. Na liście PRZED wybiciem: {len(found)}. "
                     f"Błędy danych: {len(errors)}. Dane: świece futures.")
             if errors:
                 st.warning("Nie wszystkie kontrakty udało się przeanalizować. Brak kandydatów nie oznacza pełnego skanu rynku.")
@@ -437,12 +427,12 @@ with scan_tab:
             if st.session_state.get("scan_blocked"):
                 st.error("DANE NIEDOSTĘPNE — nie można ocenić tej grupy.")
             else:
-                st.info("BRAK SYGNAŁU w tej grupie przy aktualnych ustawieniach.")
+                st.info("Brak układów PRZED wybiciem spełniających wszystkie filtry. To prawidłowy wynik — nie gonimy ceny.")
             continue
-        cols = ["symbol", "entry_score", "trend_score", "status", "powod", "rsi_1d", "zmiana_3d_pct", "zmiana_7d_pct", "od_ema20_1d_pct", "entry", "stop", "target", "wiek_danych"]
+        cols = ["symbol", "entry_score", "status", "powod", "rsi_1h", "rsi_1d", "zmiana_24h_pct", "zmiana_3d_pct", "zmiana_7d_pct", "szerokosc_bazy_48h_pct", "od_ema20_1d_pct", "wiek_danych"]
         st.dataframe(pd.DataFrame(group)[cols], use_container_width=True, hide_index=True)
         st.download_button(f"Pobierz CSV {cohort}", pd.DataFrame(group).to_csv(index=False), f"radar_{cohort.replace(' ','_')}.csv", "text/csv")
-        ready = [x for x in group if x["status"] == "GOTOWY DO OBSERWACJI"]
+        ready = []  # Early-base watchlist does not authorize simulated entries.
         if ready:
             names = [x["symbol"] for x in ready]
             chosen = st.selectbox(f"Symulacja LONG — {cohort}", names, key=f"select_{cohort}")
