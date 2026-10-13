@@ -1,4 +1,4 @@
-"""MEXC Breakout Radar v2.0.5 — research, paper simulation, and in-app alerts only."""
+"""MEXC Breakout Radar v2.0.6 — research, paper simulation, and in-app alerts only."""
 import json
 import math
 import sqlite3
@@ -11,7 +11,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="MEXC Breakout Radar v2.0.5", page_icon="📡", layout="wide")
+st.set_page_config(page_title="MEXC Breakout Radar v2.0.6", page_icon="📡", layout="wide")
 BASE = "https://api.mexc.com"
 FUTURES_BASE = "https://api.mexc.com"
 TIMEOUT = 12
@@ -42,7 +42,7 @@ def get_json(path, params=None, base=None):
     # No API keys, no retries on 403/418/429, no full URL or secret logging.
     try:
         r = requests.get((base or BASE) + path, params=params, timeout=TIMEOUT,
-                         headers={"User-Agent": "MEXC-Radar-Research/2.0.5", "Accept": "application/json"})
+                         headers={"User-Agent": "MEXC-Radar-Research/2.0.6", "Accept": "application/json"})
     except requests.RequestException as e:
         raise RuntimeError(f"Błąd sieci {path}: {type(e).__name__}: {str(e)[:160]}") from e
     if not r.ok:
@@ -171,8 +171,10 @@ def compute_signal(symbol, df, fut, cohort, min_turnover, max_spread, max_fundin
     funding, turnover = safe_float(fut.get("fundingRate")), safe_float(fut.get("amount24"))
     if not all(np.isfinite(x) for x in (spread, funding, turnover)):
         return None
-    if turnover < min_turnover or spread > max_spread or funding * 100 > max_funding:
-        return None
+    liquidity_reasons = []
+    if turnover < min_turnover: liquidity_reasons.append(f"obrót {turnover:,.0f} USDT < {min_turnover:,.0f}")
+    if spread > max_spread: liquidity_reasons.append(f"spread {spread:.2f}% > {max_spread:.2f}%")
+    if funding * 100 > max_funding: liquidity_reasons.append(f"funding {funding*100:.3f}% > {max_funding:.3f}%")
     rsi_d = rsi14(dclose)
     rsi_h = rsi14(close)
     ema20 = float(dclose.ewm(span=20, adjust=False).mean().iloc[-1])
@@ -218,19 +220,28 @@ def compute_signal(symbol, df, fut, cohort, min_turnover, max_spread, max_fundin
     score = sum(weight for passed, weight, _ in features.values() if passed)
     positives = [desc for passed, _, desc in features.values() if passed]
     missing = [desc for passed, _, desc in features.values() if not passed]
-    if gates:
-        status = "ODRZUCONY — RAJD TRWA"
-    elif base_ok and near_resistance and contraction and rising and daily_not_weak and score >= 75:
-        status = "OBSERWUJ — PRZED WYBICIEM"
+    critical = ["baza_48h", "kompresja", "blisko_oporu", "wczesny_trend", "RSI_umiarkowane"]
+    missing_critical = [k for k in critical if not features[k][0]]
+    if liquidity_reasons:
+        status = "ODRZUCONE — PŁYNNOŚĆ"
+    elif gates:
+        status = "ODRZUCONE — RAJD / PRZEGRZANIE"
+    elif not missing_critical and score >= 75:
+        status = "PRZED WYBICIEM"
+    elif len(missing_critical) <= 2 and score >= 55:
+        status = "BLISKO SETUPU"
     else:
-        status = "BRAK UKŁADU PRZED WYBICIEM"
+        status = "ODRZUCONE — BRAK BAZY"
+    reason_codes = list(liquidity_reasons) + gates + ["brak: " + k for k in missing_critical]
+
     # A watchlist is not an order signal: no actionable entry, stop or target.
     return {"symbol": symbol, "contract": str(fut.get("symbol")), "group": cohort,
-            "score": score if not gates else 0, "entry_score": score if not gates else 0,
+            "score": score, "entry_score": score,
             "trend_score": None, "status": status,
-            "powod": ("BLOKADA: " + "; ".join(gates) + ". " if gates else "") +
+            "powod": ("BLOKADA: " + "; ".join(liquidity_reasons + gates) + ". " if liquidity_reasons or gates else "") +
                      "SPEŁNIONE: " + ("; ".join(positives) or "brak") +
                      ". BRAKUJE: " + ("; ".join(missing) or "nic"),
+            "brakujace_warunki": len(missing_critical), "powody_odrzucenia": "; ".join(reason_codes) or "—",
             "rsi_1d": round(rsi_d, 1), "rsi_1h": round(rsi_h, 1),
             "zmiana_24h_pct": round(change24h, 1),
             "zmiana_3d_pct": round(change3, 1), "zmiana_7d_pct": round(change7, 1),
@@ -336,7 +347,7 @@ def paper_update():
     return errors
 
 
-st.title("📡 MEXC Breakout Radar v2.0.5")
+st.title("📡 MEXC Breakout Radar v2.0.6")
 st.caption("Badanie setupów futures LONG • osobne grupy 3–49 i 50+ dni • symulacje i alerty w aplikacji • bez zleceń")
 st.warning("Wersja eksperymentalna: szuka konsolidacji przed możliwym wybiciem, nie przewiduje rajdów. Brak sygnałów wejścia i nowych symulacji z listy. Bez zleceń.")
 
@@ -357,8 +368,11 @@ scan_tab, manual_tab, paper_tab, about_tab = st.tabs(["🔎 Dwa skanery", "🧪 
 
 with scan_tab:
     st.subheader("Młode (3–49 dni) i starsze (50+ dni)")
-    st.caption("Lista obserwacyjna PRZED wybiciem, nie sygnały transakcyjne. Rajdy i aktywa niekryptowalutowe są odrzucane. Progi eksperymentalne.")
+    st.caption("Trzy kategorie: PRZED WYBICIEM, BLISKO SETUPU, ODRZUCONE. Przyczyny i liczniki filtrów. Progi eksperymentalne.")
     if scan:
+        st.session_state["classified"] = []
+        st.session_state["counters"] = {}
+        st.session_state["errors"] = []
         st.session_state["results"] = []
         st.session_state["scan_blocked"] = None
         try:
@@ -376,24 +390,34 @@ with scan_tab:
                     futs.append((turnover, f))
             futs.sort(key=lambda x: x[0], reverse=True)
             futs = futs[:limit]
-            skipped_no_spot = 0
-            found = []
+            classified = []
             errors = []
             blocked = None
+            counters = {"przed": 0, "blisko": 0, "rajd": 0, "plynnosc": 0, "brak_bazy": 0,
+                        "brak_historii": 0, "brak_wskaznikow": 0}
             bar = st.progress(0)
             for i, (_, f) in enumerate(futs):
                 symbol = str(f["symbol"]).replace("_", "")
                 try:
                     age, age_note = age_from_futures_history(str(f["symbol"]))
                     if age is None or age < 3:
+                        counters["brak_historii"] += 1
                         continue
                     cohort = "3–49 dni" if age <= 49 else "50+ dni"
                     df = futures_candles(str(f["symbol"]), "Min60", 160)
                     daily = futures_candles(str(f["symbol"]), "Day1", 85)
                     result = compute_signal(symbol, df, f, cohort, min_turnover, max_spread, max_funding, daily=daily)
-                    if result and result["status"] == "OBSERWUJ — PRZED WYBICIEM" and result["score"] >= min_score:
-                        result["wiek_danych"] = age_note
-                        found.append(result)
+                    if result is None:
+                        counters["brak_wskaznikow"] += 1
+                        continue
+                    result["wiek_danych"] = age_note
+                    classified.append(result)
+                    status = result["status"]
+                    if status == "PRZED WYBICIEM": counters["przed"] += 1
+                    elif status == "BLISKO SETUPU": counters["blisko"] += 1
+                    elif "RAJD" in status: counters["rajd"] += 1
+                    elif "PŁYNNOŚĆ" in status: counters["plynnosc"] += 1
+                    else: counters["brak_bazy"] += 1
                 except MarketDataHTTPError as e:
                     errors.append(f"{symbol}: {e}")
                     if e.status in (403, 418, 429, 451):
@@ -404,44 +428,61 @@ with scan_tab:
                 finally:
                     bar.progress((i + 1) / max(1, len(futs)))
             bar.empty()
-            st.session_state["results"] = found
+            st.session_state["classified"] = classified
+            st.session_state["counters"] = counters
+            st.session_state["errors"] = errors
             st.session_state["scan_blocked"] = blocked
             if blocked:
-                st.error("DANE NIEDOSTĘPNE — MEXC odrzucił żądanie. Skan przerwany, aby nie powtarzać blokowanych zapytań. " + blocked)
-            st.info(f"Sprawdzono {len(futs)} kontraktów. Na liście PRZED wybiciem: {len(found)}. "
-                    f"Błędy danych: {len(errors)}. Dane: świece futures.")
+                st.error("DANE NIEDOSTĘPNE — skan przerwany. " + blocked)
+            st.info(f"Wybrano {len(futs)} kontraktów według obrotu. Przeanalizowano: {len(classified)}. "
+                    f"Przed wybiciem: {counters['przed']}; blisko setupu: {counters['blisko']}; "
+                    f"odrzucone: {counters['rajd']+counters['plynnosc']+counters['brak_bazy']}. "
+                    f"Błędy API: {len(errors)}. Świece futures.")
             if errors:
                 st.warning("Nie wszystkie kontrakty udało się przeanalizować. Brak kandydatów nie oznacza pełnego skanu rynku.")
             if errors:
                 with st.expander("Błędy pobierania danych"):
                     st.write(errors[:25])
         except Exception as e:
-            st.session_state["results"] = []
+            st.session_state["classified"] = []
+            st.session_state["counters"] = {}
             st.session_state["scan_blocked"] = str(e)
             st.error(f"DANE NIEDOSTĘPNE — skanowanie nie powiodło się: {e}")
-    results = st.session_state.get("results", [])
+    classified = st.session_state.get("classified", [])
+    counters = st.session_state.get("counters", {})
+    if counters:
+        st.markdown("### 🔍 Diagnostyka filtrów")
+        st.dataframe(pd.DataFrame([
+            {"Filtr / wynik": "PRZED WYBICIEM", "Liczba": counters.get("przed", 0)},
+            {"Filtr / wynik": "BLISKO SETUPU", "Liczba": counters.get("blisko", 0)},
+            {"Filtr / wynik": "Rajd / przegrzanie", "Liczba": counters.get("rajd", 0)},
+            {"Filtr / wynik": "Płynność / spread / funding", "Liczba": counters.get("plynnosc", 0)},
+            {"Filtr / wynik": "Brak bazy / warunków", "Liczba": counters.get("brak_bazy", 0)},
+            {"Filtr / wynik": "Za krótka historia / <3 dni", "Liczba": counters.get("brak_historii", 0)},
+            {"Filtr / wynik": "Brak wymaganych wskaźników", "Liczba": counters.get("brak_wskaznikow", 0)},
+            {"Filtr / wynik": "Błędy API", "Liczba": len(st.session_state.get("errors", []))},
+        ]), hide_index=True, use_container_width=True)
+        st.caption("Kategorie rozłączne: każdy kontrakt trafia do pierwszej właściwej kategorii. Odrzucone instrumenty pozostają widoczne tylko w diagnostyce.")
+    cols = ["symbol", "entry_score", "status", "powod", "brakujace_warunki", "rsi_1h", "rsi_1d", "zmiana_24h_pct", "zmiana_3d_pct", "zmiana_7d_pct", "szerokosc_bazy_48h_pct", "od_ema20_1d_pct", "wiek_danych"]
     for cohort in ["3–49 dni", "50+ dni"]:
         st.markdown(f"### {'🆕' if cohort.startswith('3') else '🏛️'} {cohort}")
-        group = sorted([x for x in results if x["group"] == cohort], key=lambda x: x["score"], reverse=True)
-        if not group:
-            if st.session_state.get("scan_blocked"):
-                st.error("DANE NIEDOSTĘPNE — nie można ocenić tej grupy.")
+        group = [x for x in classified if x["group"] == cohort]
+        for status, heading in [("PRZED WYBICIEM", "🟢 PRZED WYBICIEM"), ("BLISKO SETUPU", "🟡 BLISKO SETUPU")]:
+            st.markdown(f"**{heading}**")
+            rows = sorted([x for x in group if x["status"] == status and (status != "PRZED WYBICIEM" or x["score"] >= min_score)], key=lambda x: (-x["score"], x["brakujace_warunki"]))
+            if rows:
+                st.dataframe(pd.DataFrame(rows)[cols], use_container_width=True, hide_index=True)
+                st.download_button(f"Pobierz CSV {heading} {cohort}", pd.DataFrame(rows).to_csv(index=False), f"radar_{status.replace(' ', '_')}_{cohort.replace(' ','_')}.csv", "text/csv", key=f"csv_{status}_{cohort}")
             else:
-                st.info("Brak układów PRZED wybiciem spełniających wszystkie filtry. To prawidłowy wynik — nie gonimy ceny.")
-            continue
-        cols = ["symbol", "entry_score", "status", "powod", "rsi_1h", "rsi_1d", "zmiana_24h_pct", "zmiana_3d_pct", "zmiana_7d_pct", "szerokosc_bazy_48h_pct", "od_ema20_1d_pct", "wiek_danych"]
-        st.dataframe(pd.DataFrame(group)[cols], use_container_width=True, hide_index=True)
-        st.download_button(f"Pobierz CSV {cohort}", pd.DataFrame(group).to_csv(index=False), f"radar_{cohort.replace(' ','_')}.csv", "text/csv")
-        ready = []  # Early-base watchlist does not authorize simulated entries.
-        if ready:
-            names = [x["symbol"] for x in ready]
-            chosen = st.selectbox(f"Symulacja LONG — {cohort}", names, key=f"select_{cohort}")
-            if st.button(f"Dodaj symulację {chosen}", key=f"add_{cohort}"):
-                try:
-                    paper_open(next(x for x in ready if x["symbol"] == chosen), capital, risk_pct, fee_pct, slip_pct)
-                    st.success("Dodano symulację. Nie wysłano żadnego zlecenia.")
-                except Exception as e:
-                    st.error(str(e))
+                st.info("Brak instrumentów w tej kategorii.")
+        rejected = [x for x in group if x["status"].startswith("ODRZUCONE")]
+        with st.expander(f"🔴 ODRZUCONE — diagnostyka ({len(rejected)})"):
+            if rejected:
+                st.dataframe(pd.DataFrame(rejected)[cols], use_container_width=True, hide_index=True)
+                st.download_button(f"Pobierz odrzucone CSV {cohort}", pd.DataFrame(rejected).to_csv(index=False), f"odrzucone_{cohort.replace(' ','_')}.csv", "text/csv", key=f"rej_{cohort}")
+            else:
+                st.caption("Brak odrzuconych z dostępnymi wskaźnikami.")
+    st.caption("Żadna kategoria nie stanowi rekomendacji transakcji. Bez automatycznych zleceń i nowych symulacji z listy.")
 
 with manual_tab:
     symbol = st.text_input("Para spot, np. TIAUSDT", value="TIAUSDT").strip().upper()
