@@ -1,4 +1,4 @@
-"""MEXC Breakout Radar v2.0.6 — research, paper simulation, and in-app alerts only."""
+"""MEXC Breakout Radar v2.0.7 — research, paper simulation, and in-app alerts only."""
 import json
 import math
 import sqlite3
@@ -11,7 +11,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="MEXC Breakout Radar v2.0.6", page_icon="📡", layout="wide")
+st.set_page_config(page_title="MEXC Breakout Radar v2.0.7", page_icon="📡", layout="wide")
 BASE = "https://api.mexc.com"
 FUTURES_BASE = "https://api.mexc.com"
 TIMEOUT = 12
@@ -42,7 +42,7 @@ def get_json(path, params=None, base=None):
     # No API keys, no retries on 403/418/429, no full URL or secret logging.
     try:
         r = requests.get((base or BASE) + path, params=params, timeout=TIMEOUT,
-                         headers={"User-Agent": "MEXC-Radar-Research/2.0.6", "Accept": "application/json"})
+                         headers={"User-Agent": "MEXC-Radar-Research/2.0.7", "Accept": "application/json"})
     except requests.RequestException as e:
         raise RuntimeError(f"Błąd sieci {path}: {type(e).__name__}: {str(e)[:160]}") from e
     if not r.ok:
@@ -347,7 +347,7 @@ def paper_update():
     return errors
 
 
-st.title("📡 MEXC Breakout Radar v2.0.6")
+st.title("📡 MEXC Breakout Radar v2.0.7")
 st.caption("Badanie setupów futures LONG • osobne grupy 3–49 i 50+ dni • symulacje i alerty w aplikacji • bez zleceń")
 st.warning("Wersja eksperymentalna: szuka konsolidacji przed możliwym wybiciem, nie przewiduje rajdów. Brak sygnałów wejścia i nowych symulacji z listy. Bez zleceń.")
 
@@ -364,7 +364,7 @@ with st.sidebar:
     slip_pct = st.number_input("Szacowany poślizg na stronę (%)", 0.0, 2.0, 0.1, 0.05)
     scan = st.button("🔎 Skanuj futures LONG", type="primary", use_container_width=True)
 
-scan_tab, manual_tab, paper_tab, about_tab = st.tabs(["🔎 Dwa skanery", "🧪 Analiza ręczna", "📒 Symulacje i alerty", "ℹ️ Metodologia"])
+scan_tab, manual_tab, paper_tab, traders_tab, about_tab = st.tabs(["🔎 Dwa skanery", "🧪 Analiza ręczna", "📒 Symulacje i alerty", "🏆 Traderzy futures", "ℹ️ Metodologia"])
 
 with scan_tab:
     st.subheader("Młode (3–49 dni) i starsze (50+ dni)")
@@ -530,6 +530,58 @@ with paper_tab:
         opened = trades[trades.status == "OPEN"]
         if not opened.empty:
             st.warning(f"🔔 Alert w aplikacji: {len(opened)} otwartych symulacji do monitorowania. Powiadomienia push 24/7 nie są jeszcze aktywne.")
+
+with traders_tab:
+    st.subheader("🏆 Publiczni traderzy futures — lista obserwacyjna")
+    st.warning("To nie są zweryfikowane konta o trwałej przewadze. Dane publiczne bywają opóźnione, a wysoki ROI lub win rate nie oznacza niskiego ryzyka. Bez automatycznego kopiowania transakcji.")
+    st.markdown("[Otwórz ranking MEXC Copy Trading](https://www.mexc.com/futures/copyTrade/home) · [Porównaj traderów na MEXC](https://www.mexc.com/futures/copyTrade/leaderVS)")
+    st.caption("Na giełdzie scentralizowanej publiczny profil tradera nie jest jego adresem portfela on-chain. Nie przypisujemy anonimowym adresom niepotwierdzonych wyników.")
+    st.markdown("**Przykładowy publiczny profil do sprawdzenia — nie rekomendacja:** [MEXC DD0516](https://www.mexc.com/futures/copyTrade/leader/DD0516). Sprawdź aktualne wyniki na giełdzie; nie są pobierane automatycznie.")
+    st.markdown("#### Własna lista profili i porównanie wyników")
+    st.caption("Wpisz dane widoczne na profilu tradera (najlepiej 90–180 dni). Puste lub niepełne dane nie otrzymują wysokiej oceny. Dane przechowywane tylko w bieżącej sesji Streamlit — pobierz CSV, aby ich nie stracić.")
+    if "trader_watch" not in st.session_state:
+        st.session_state.trader_watch = []
+    with st.form("trader_add", clear_on_submit=True):
+        name = st.text_input("Nazwa publiczna / identyfikator profilu")
+        url = st.text_input("Pełny link do profilu MEXC", placeholder="https://www.mexc.com/futures/copyTrade/leader/...")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            days = st.number_input("Okres oceny (dni)", 0, 365, 90, 1)
+            trades_n = st.number_input("Liczba zamkniętych transakcji", 0, 100000, 0, 1)
+        with c2:
+            pnl = st.number_input("PNL (USDT) w okresie", value=0.0, step=100.0)
+            roi = st.number_input("ROI (%) w okresie", value=0.0, step=1.0)
+        with c3:
+            win = st.number_input("Wygrane (%)", 0.0, 100.0, 0.0, 1.0)
+            dd = st.number_input("Maks. obsunięcie (%) — 0 jeśli nieznane", 0.0, 100.0, 0.0, 1.0)
+        notes = st.text_input("Uwagi / źródło danych / data odczytu")
+        submitted = st.form_submit_button("➕ Dodaj do obserwowanych")
+    if submitted:
+        if not name.strip() or not (url.startswith("https://www.mexc.com/futures/copyTrade/leader/") or url.startswith("https://www.mexc.co/futures/copyTrade/leader/")):
+            st.error("Podaj nazwę i poprawny publiczny link profilu MEXC (ścieżka /futures/copyTrade/leader/...).")
+        else:
+            enough = days >= 90 and trades_n >= 30 and dd > 0
+            if not enough:
+                verdict = "NIEZWERYFIKOWANY — za krótki okres, za mało transakcji lub brak drawdown"
+                quality = None
+            elif pnl <= 0 or roi <= 0 or dd >= 35:
+                verdict = "WYSOKIE RYZYKO / BRAK POTWIERDZONEJ RENTOWNOŚCI"
+                quality = 0
+            else:
+                quality = round(max(0, min(100, 45 + min(15, trades_n / 20) + min(15, days / 12) + min(10, win / 10) - dd * 1.2)))
+                verdict = "DO DALSZEJ WERYFIKACJI" if quality >= 65 else "OSTROŻNIE — SŁABE PARAMETRY"
+            st.session_state.trader_watch.append({"profil": name.strip(), "url": url.strip(), "dni": days, "transakcje": trades_n, "PNL_USDT": pnl, "ROI_pct": roi, "win_rate_pct": win, "max_drawdown_pct": dd if dd else None, "ocena_wstepna": quality, "status": verdict, "uwagi": notes, "odczyt_UTC": utcnow().isoformat(timespec="minutes")})
+            st.success("Dodano do listy obserwacyjnej. Ocena jest heurystyczna, nie rankingiem potwierdzonych zwycięzców.")
+    if st.session_state.trader_watch:
+        df_traders = pd.DataFrame(st.session_state.trader_watch)
+        st.dataframe(df_traders, use_container_width=True, hide_index=True, column_config={"url": st.column_config.LinkColumn("Profil MEXC")})
+        st.download_button("⬇️ Eksport profili CSV", df_traders.to_csv(index=False).encode("utf-8-sig"), "mexc_trader_watchlist.csv", "text/csv")
+        if st.button("🗑️ Wyczyść listę sesji"):
+            st.session_state.trader_watch = []
+            st.rerun()
+    else:
+        st.info("Lista jest pusta. Otwórz ranking MEXC, wybierz publiczny profil i wpisz dane z jego statystyk.")
+    st.caption("Ocena wstępna nie uwzględnia dźwigni, ryzyka likwidacji, wielkości kapitału ani survivorship bias. Sam win rate nie wystarcza. Żadnych kluczy API, zleceń ani kopiowania pozycji.")
 
 with about_tab:
     st.markdown("""**Ograniczenia v2.0**\n\n- Brak prawdziwych zleceń i brak kluczy prywatnych.\n- Cena wejścia pochodzi z orientacyjnego ask futures, a nowe symulacje sprawdzają SL/TP na **zamkniętych świecach futures**. To nadal nie jest wierny backtest wykonania zleceń.\n- Ryzyko nowej symulacji uwzględnia założone prowizje i poślizg przy SL, ale nie gwarantuje limitu straty; funding, luki i likwidacja nie są księgowane.\n- Przebieg ceny wewnątrz świecy jest nieznany; przy jednoczesnym SL i TP zakładamy najgorszy przypadek.\n- Wiek kontraktu jest oszacowany na podstawie ograniczonej historii świec futures, nie oficjalnej daty listingu.\n- Skan obejmuje wybrane kontrakty o największym obrocie, a nie cały rynek.\n- Brak samodzielnych alertów w tle. Streamlit Community Cloud nie jest trwałą bazą danych.\n- Score nie jest skalibrowanym prawdopodobieństwem zysku. Wyniki symulacji nie dowodzą przewagi rynkowej.\n\n**Następny etap:** osobny worker 24/7, trwała baza, funding i rygorystyczne testy historyczne.""")
