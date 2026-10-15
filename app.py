@@ -1,4 +1,4 @@
-"""MEXC Breakout Radar v2.0.7 — research, paper simulation, and in-app alerts only."""
+"""MEXC Breakout Radar v2.0.8 — research, paper simulation, and in-app alerts only."""
 import json
 import math
 import sqlite3
@@ -11,7 +11,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="MEXC Breakout Radar v2.0.7", page_icon="📡", layout="wide")
+st.set_page_config(page_title="MEXC Breakout Radar v2.0.8", page_icon="📡", layout="wide")
 BASE = "https://api.mexc.com"
 FUTURES_BASE = "https://api.mexc.com"
 TIMEOUT = 12
@@ -42,7 +42,7 @@ def get_json(path, params=None, base=None):
     # No API keys, no retries on 403/418/429, no full URL or secret logging.
     try:
         r = requests.get((base or BASE) + path, params=params, timeout=TIMEOUT,
-                         headers={"User-Agent": "MEXC-Radar-Research/2.0.7", "Accept": "application/json"})
+                         headers={"User-Agent": "MEXC-Radar-Research/2.0.8", "Accept": "application/json"})
     except requests.RequestException as e:
         raise RuntimeError(f"Błąd sieci {path}: {type(e).__name__}: {str(e)[:160]}") from e
     if not r.ok:
@@ -107,7 +107,7 @@ def futures_candles(contract, interval="Min60", limit=180):
     """Public contract candles, timestamps in seconds, no spot fallback."""
     if not contract.endswith("_USDT") or not contract.replace("_", "").isalnum():
         raise ValueError("Niepoprawny symbol kontraktu")
-    seconds = {"Min60": 3600, "Day1": 86400}.get(interval)
+    seconds = {"Min15": 900, "Min60": 3600, "Day1": 86400}.get(interval)
     if seconds is None:
         raise ValueError("Nieobsługiwany interwał futures")
     end = int(time.time())
@@ -252,6 +252,93 @@ def compute_signal(symbol, df, fut, cohort, min_turnover, max_spread, max_fundin
             "quote_time": utcnow().isoformat()}
 
 
+
+def early_breakout_15m(symbol, df, fut, cohort, min_turnover, max_spread, max_funding, daily=None):
+    """Prospective 15m setup using only CLOSED candles; no look-ahead.
+
+    Score describes a measurable setup, not probability of a future rally.
+    """
+    if len(df) < 85:
+        return None
+    c, h, l, v = (df[k].astype(float) for k in ('close','high','low','quote_volume'))
+    price = float(c.iloc[-1]); previous = float(c.iloc[-2])
+    if price <= 0 or previous <= 0 or (v < 0).any():
+        return None
+    bid, ask = safe_float(fut.get('bid1')), safe_float(fut.get('ask1'))
+    spread = (ask / bid - 1)*100 if bid > 0 and ask >= bid else float('nan')
+    funding, turnover = safe_float(fut.get('fundingRate')), safe_float(fut.get('amount24'))
+    if not all(np.isfinite(x) for x in (spread, funding, turnover)):
+        return None
+    rsi = rsi14(c)
+    ema20 = c.ewm(span=20, adjust=False).mean()
+    ema50 = c.ewm(span=50, adjust=False).mean()
+    # Reference window excludes the most recent candle. Prevents scoring an already finished pump.
+    base = df.iloc[-49:-1]
+    bh, bl = float(base.high.max()), float(base.low.min())
+    width = (bh/bl-1)*100 if bl > 0 else float('inf')
+    old_range = df.iloc[-73:-25]
+    old_width = (float(old_range.high.max())/float(old_range.low.min())-1)*100 if float(old_range.low.min()) > 0 else float('inf')
+    vol_base = float(v.iloc[-49:-1].median())
+    vol_ratio = float(v.iloc[-1]/vol_base) if vol_base > 0 else float('nan')
+    rise_1h = (price/float(c.iloc[-5])-1)*100
+    rise_4h = (price/float(c.iloc[-17])-1)*100
+    rise_24h = (price/float(c.iloc[-97])-1)*100 if len(c)>=97 else float('nan')
+    last_candle = (price/float(df.open.iloc[-1])-1)*100
+    from_low = (price/bl-1)*100 if bl > 0 else float('inf')
+    dist_ema = (price/float(ema20.iloc[-1])-1)*100
+    rsi_d = rsi14(daily.close.astype(float)) if daily is not None and len(daily)>=30 else float('nan')
+    # Hard stops are evaluated BEFORE scoring; do not label already explosive candles as early.
+    blocks = []
+    if turnover < min_turnover: blocks.append('za mały obrót 24h')
+    if spread > max_spread: blocks.append(f'spread {spread:.2f}%')
+    if funding*100 > max_funding: blocks.append(f'funding {funding*100:.3f}%')
+    if rise_1h >= 7: blocks.append(f'już +{rise_1h:.1f}% / 1h')
+    if rise_4h >= 12: blocks.append(f'już +{rise_4h:.1f}% / 4h')
+    if np.isfinite(rise_24h) and rise_24h >= 18: blocks.append(f'już +{rise_24h:.1f}% / 24h')
+    if last_candle >= 4: blocks.append(f'świeca 15m już +{last_candle:.1f}%')
+    if rsi >= 72: blocks.append(f'RSI 15m {rsi:.1f} (przegrzanie)')
+    if np.isfinite(rsi_d) and rsi_d >= 76: blocks.append(f'RSI 1D {rsi_d:.1f}')
+    if dist_ema >= 6: blocks.append(f'cena +{dist_ema:.1f}% ponad EMA20 15m')
+    if price > bh*1.025: blocks.append(f'cena już {(price/bh-1)*100:+.1f}% nad oporem')
+    if width > 30: blocks.append(f'brak stabilnej bazy 12h: {width:.1f}%')
+    # The desired watchlist: quiet base, near its ceiling, not an explosive breakout.
+    tests = [
+      ('wąska baza 12h', width <= 9, 25, f'szerokość {width:.1f}%'),
+      ('kompresja względem wcześniejszych 12h', width < old_width*0.8, 15, f'{width:.1f}% vs {old_width:.1f}%'),
+      ('blisko oporu', bh*0.965 <= price <= bh*1.008, 20, f'odległość {(price/bh-1)*100:+.1f}%'),
+      ('trend nie jest spadkowy', price >= float(ema50.iloc[-1])*0.99, 10, 'cena blisko/powyżej EMA50'),
+      ('RSI bez przegrzania', 42 <= rsi < 65, 10, f'RSI15 {rsi:.1f}'),
+      ('wolumen bez eksplozji', np.isfinite(vol_ratio) and 0.7 <= vol_ratio <= 2.5, 10, f'obrót 15m {vol_ratio:.1f}x mediany'),
+      ('brak silnego rajdu w 4h', -5 <= rise_4h < 5, 10, f'zmiana 4h {rise_4h:+.1f}%'),
+    ]
+    score = sum(w for _, ok, w, _ in tests if ok)
+    failed = [f'{name} ({detail})' for name,ok,_,detail in tests if not ok]
+    passed = [f'{name} ({detail})' for name,ok,_,detail in tests if ok]
+    essential = [tests[i][1] for i in (0,2,4,6)]
+    if blocks: status = 'ODRZUCONE — RAJD / RYZYKO'
+    elif all(essential) and score >= 75: status = 'PRZED WYBICIEM'
+    elif sum(not x for x in essential) <= 2 and score >= 50: status = 'BLISKO SETUPU'
+    else: status = 'ODRZUCONE — BRAK BAZY'
+    return {
+      'symbol': symbol, 'contract': str(fut.get('symbol')), 'group': cohort,
+      'entry_score': score, 'score': score, 'trend_score': None, 'status': status,
+      'powod': ('BLOKADA: '+ '; '.join(blocks)+'. ' if blocks else '') +
+               'TAK: '+('; '.join(passed) or 'brak')+'. BRAK: '+('; '.join(failed) or 'nic'),
+      'brakujace_warunki': sum(not x for x in essential),
+      'powody_odrzucenia': '; '.join(blocks+failed) or '—',
+      'rsi_1h': round(rsi,1), 'rsi_1d': round(rsi_d,1) if np.isfinite(rsi_d) else None,
+      'zmiana_24h_pct': round(rise_24h,1) if np.isfinite(rise_24h) else None,
+      'zmiana_3d_pct': None, 'zmiana_7d_pct': None,
+      'szerokosc_bazy_48h_pct': round(width,1), 'od_ema20_1d_pct': round(dist_ema,1),
+      'opór_15m': round(bh,8), 'od_oporu_pct': round((price/bh-1)*100,2),
+      'zmiana_1h_pct': round(rise_1h,2), 'zmiana_4h_pct': round(rise_4h,2),
+      'wolumen_15m_x': round(vol_ratio,2) if np.isfinite(vol_ratio) else None,
+      'ostatnia_swieca_15m_utc': str(df.iloc[-1].close_ts),
+      'entry': None, 'stop': None, 'target': None, 'spot_close': price,
+      'volume_ratio': vol_ratio, 'spread_pct': spread, 'funding_pct': funding*100,
+      'turnover': turnover, 'quote_time': utcnow().isoformat()
+    }
+
 def db_connect():
     con = sqlite3.connect(DB, timeout=8)
     con.execute("""CREATE TABLE IF NOT EXISTS paper (
@@ -347,7 +434,7 @@ def paper_update():
     return errors
 
 
-st.title("📡 MEXC Breakout Radar v2.0.7")
+st.title("📡 MEXC Breakout Radar v2.0.8")
 st.caption("Badanie setupów futures LONG • osobne grupy 3–49 i 50+ dni • symulacje i alerty w aplikacji • bez zleceń")
 st.warning("Wersja eksperymentalna: szuka konsolidacji przed możliwym wybiciem, nie przewiduje rajdów. Brak sygnałów wejścia i nowych symulacji z listy. Bez zleceń.")
 
@@ -367,8 +454,8 @@ with st.sidebar:
 scan_tab, manual_tab, paper_tab, traders_tab, about_tab = st.tabs(["🔎 Dwa skanery", "🧪 Analiza ręczna", "📒 Symulacje i alerty", "🏆 Traderzy futures", "ℹ️ Metodologia"])
 
 with scan_tab:
-    st.subheader("Młode (3–49 dni) i starsze (50+ dni)")
-    st.caption("Trzy kategorie: PRZED WYBICIEM, BLISKO SETUPU, ODRZUCONE. Przyczyny i liczniki filtrów. Progi eksperymentalne.")
+    st.subheader("Radar PRZED wybiciem — zamknięte świece 15m")
+    st.caption("Baza 12h + opór + umiarkowany RSI 15m. Rajdy już rozpoczęte są blokowane. Analiza wyłącznie po zamknięciu świecy; aktualizacja po ponownym skanie. Progi eksperymentalne.")
     if scan:
         st.session_state["classified"] = []
         st.session_state["counters"] = {}
@@ -404,9 +491,9 @@ with scan_tab:
                         counters["brak_historii"] += 1
                         continue
                     cohort = "3–49 dni" if age <= 49 else "50+ dni"
-                    df = futures_candles(str(f["symbol"]), "Min60", 160)
+                    df = futures_candles(str(f["symbol"]), "Min15", 110)
                     daily = futures_candles(str(f["symbol"]), "Day1", 85)
-                    result = compute_signal(symbol, df, f, cohort, min_turnover, max_spread, max_funding, daily=daily)
+                    result = early_breakout_15m(symbol, df, f, cohort, min_turnover, max_spread, max_funding, daily=daily)
                     if result is None:
                         counters["brak_wskaznikow"] += 1
                         continue
@@ -463,7 +550,7 @@ with scan_tab:
             {"Filtr / wynik": "Błędy API", "Liczba": len(st.session_state.get("errors", []))},
         ]), hide_index=True, use_container_width=True)
         st.caption("Kategorie rozłączne: każdy kontrakt trafia do pierwszej właściwej kategorii. Odrzucone instrumenty pozostają widoczne tylko w diagnostyce.")
-    cols = ["symbol", "entry_score", "status", "powod", "brakujace_warunki", "rsi_1h", "rsi_1d", "zmiana_24h_pct", "zmiana_3d_pct", "zmiana_7d_pct", "szerokosc_bazy_48h_pct", "od_ema20_1d_pct", "wiek_danych"]
+    cols = ["symbol", "entry_score", "status", "powod", "brakujace_warunki", "rsi_1h", "zmiana_1h_pct", "zmiana_4h_pct", "zmiana_24h_pct", "szerokosc_bazy_48h_pct", "opór_15m", "od_oporu_pct", "wolumen_15m_x", "ostatnia_swieca_15m_utc", "wiek_danych"]
     for cohort in ["3–49 dni", "50+ dni"]:
         st.markdown(f"### {'🆕' if cohort.startswith('3') else '🏛️'} {cohort}")
         group = [x for x in classified if x["group"] == cohort]
@@ -482,7 +569,7 @@ with scan_tab:
                 st.download_button(f"Pobierz odrzucone CSV {cohort}", pd.DataFrame(rejected).to_csv(index=False), f"odrzucone_{cohort.replace(' ','_')}.csv", "text/csv", key=f"rej_{cohort}")
             else:
                 st.caption("Brak odrzuconych z dostępnymi wskaźnikami.")
-    st.caption("Żadna kategoria nie stanowi rekomendacji transakcji. Bez automatycznych zleceń i nowych symulacji z listy.")
+    st.caption("15m = zamknięte świece, skan ręczny, brak alertów w czasie rzeczywistym. Nie przewiduje przyszłego rajdu. Żadna kategoria nie stanowi rekomendacji transakcji.")
 
 with manual_tab:
     symbol = st.text_input("Para spot, np. TIAUSDT", value="TIAUSDT").strip().upper()
