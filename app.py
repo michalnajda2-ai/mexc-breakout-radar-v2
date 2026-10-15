@@ -1,674 +1,175 @@
-"""MEXC Breakout Radar v2.0.8 — research, paper simulation, and in-app alerts only."""
-import json
-import math
-import sqlite3
-import time
+"""MEXC New Coins Volume Radar v3.0: public USDT perpetual data, no orders."""
 from datetime import datetime, timezone, timedelta
-from pathlib import Path
-
-import numpy as np
-import pandas as pd
+import math
+import time
 import requests
+import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="MEXC Breakout Radar v2.0.8", page_icon="📡", layout="wide")
-BASE = "https://api.mexc.com"
-FUTURES_BASE = "https://api.mexc.com"
-TIMEOUT = 12
-DB = Path("radar_paper.sqlite3")
+st.set_page_config(page_title='MEXC Nowe Kryptowaluty | Wolumen', page_icon='🌱', layout='wide')
+BASES = ('https://contract.mexc.com', 'https://api.mexc.com')
+MIN_DAYS, MAX_DAYS = 3, 77
+MIN_USDT = 300_000
+SESSION = requests.Session()
+SESSION.headers.update({'Accept':'application/json', 'User-Agent':'MEXC-New-Listings-Volume-Radar/3.0'})
 
+def api(path, params=None):
+    errors=[]
+    for base in BASES:
+        try:
+            response=SESSION.get(base+path, params=params, timeout=12)
+            if response.status_code in (403,418,429):
+                raise RuntimeError(f'HTTP {response.status_code}: API ogranicza dostęp. Spróbuj później.')
+            response.raise_for_status()
+            obj=response.json()
+            if not isinstance(obj,dict) or obj.get('success') is not True:
+                raise ValueError(f'Niepoprawna odpowiedź API ({obj.get("code") if isinstance(obj,dict) else "format"})')
+            return obj.get('data')
+        except RuntimeError:
+            raise
+        except (requests.RequestException,ValueError) as exc:
+            errors.append(f'{base}: {str(exc)[:95]}')
+    raise RuntimeError(' | '.join(errors))
 
-def utcnow():
-    return datetime.now(timezone.utc)
-
-
-def safe_float(v, default=float("nan")):
+def number(x):
     try:
-        n = float(v)
-        return n if math.isfinite(n) else default
+        v=float(x)
+        return v if math.isfinite(v) else None
     except (TypeError, ValueError):
-        return default
+        return None
 
+def listing_date(detail):
+    # Metadata are not always published by the exchange. Never substitute spot age.
+    for key in ('createTime','create_time','onlineTime','online_time','listingTime','launchTime'):
+        v=number(detail.get(key))
+        if v and v>1_000_000_000:
+            if v>1e12: v/=1000
+            try: return datetime.fromtimestamp(v,timezone.utc),key
+            except (ValueError,OverflowError,OSError): pass
+    return None,None
 
-class MarketDataHTTPError(RuntimeError):
-    def __init__(self, status, endpoint, detail="", retry_after=""):
-        self.status = status
-        self.endpoint = endpoint
-        self.retry_after = retry_after
-        super().__init__(f"HTTP {status} | {endpoint} | {detail[:180]}" + (f" | Retry-After: {retry_after}s" if retry_after else ""))
+@st.cache_data(ttl=180,show_spinner=False)
+def universe():
+    details=api('/api/v1/contract/detail')
+    tickers=api('/api/v1/contract/ticker')
+    if not isinstance(details,list) or not isinstance(tickers,list):
+        raise ValueError('API nie zwróciło listy kontraktów i tickerów')
+    return details,tickers
 
-
-def get_json(path, params=None, base=None):
-    # No API keys, no retries on 403/418/429, no full URL or secret logging.
-    try:
-        r = requests.get((base or BASE) + path, params=params, timeout=TIMEOUT,
-                         headers={"User-Agent": "MEXC-Radar-Research/2.0.8", "Accept": "application/json"})
-    except requests.RequestException as e:
-        raise RuntimeError(f"Błąd sieci {path}: {type(e).__name__}: {str(e)[:160]}") from e
-    if not r.ok:
-        detail = r.text[:180].replace("\n", " ").replace("\r", " ")
-        raise MarketDataHTTPError(r.status_code, path, detail, r.headers.get("Retry-After", ""))
-    try:
-        return r.json()
-    except ValueError as e:
-        raise RuntimeError(f"Odpowiedź nie jest JSON: {path}, HTTP {r.status_code}") from e
-
-
-@st.cache_data(ttl=120, show_spinner=False)
-def spot_tickers():
-    data = get_json("/api/v3/ticker/24hr")
-    if not isinstance(data, list):
-        raise ValueError("Nieprawidłowa odpowiedź ticker spot")
-    return data
-
-
-@st.cache_data(ttl=120, show_spinner=False)
-def futures_tickers():
-    # Public MEXC contract endpoints; failures are visible, not silently replaced with spot data.
-    data = get_json("/api/v1/contract/ticker", base=FUTURES_BASE)
-    if not isinstance(data, dict) or not data.get("success"):
-        raise ValueError("API kontraktów nie zwróciło poprawnej odpowiedzi")
-    return data.get("data") or []
-
-
-@st.cache_data(ttl=120, show_spinner=False)
-def candles(symbol, interval="60m", limit=200):
-    # MEXC Spot uses 60m for hourly candles; 1h yields HTTP 400 / -1121.
-    interval = {"1h": "60m", "1H": "60m", "4H": "4h"}.get(interval, interval)
-    data = get_json("/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": limit})
-    if not isinstance(data, list) or not data:
+@st.cache_data(ttl=300,show_spinner=False)
+def daily(symbol):
+    if not isinstance(symbol,str) or not symbol.endswith('_USDT') or not symbol.replace('_','').isalnum():
+        raise ValueError('Nieprawidłowy symbol')
+    end=int(time.time())
+    data=api(f'/api/v1/contract/kline/{symbol}', {'interval':'Day1','start':end-17*86400,'end':end})
+    if not isinstance(data,dict) or not all(isinstance(data.get(k),list) for k in ('time','amount','close')):
+        raise ValueError('Niepoprawne świece dzienne')
+    n=len(data['time'])
+    if not n or len(data['amount'])!=n or len(data['close'])!=n:
         return pd.DataFrame()
-    if any(not isinstance(r, list) or len(r) < 8 for r in data):
-        raise ValueError("Niepoprawny format świec spot")
-    df = pd.DataFrame([r[:8] for r in data], columns=["ts", "open", "high", "low", "close", "volume", "close_ts", "quote_volume"])
-    for c in ["open", "high", "low", "close", "volume", "quote_volume"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["ts"] = pd.to_datetime(df.ts, unit="ms", utc=True)
-    df["close_ts"] = pd.to_datetime(pd.to_numeric(df.close_ts, errors="coerce"), unit="ms", utc=True)
-    # Never score an incomplete candle.
-    df = df[df.close_ts < pd.Timestamp.now(tz="UTC")]
-    return df.dropna().sort_values("ts").drop_duplicates("ts")
+    df=pd.DataFrame({'ts':pd.to_datetime(pd.to_numeric(data['time'],errors='coerce'),unit='s',utc=True),
+                     'usdt':pd.to_numeric(data['amount'],errors='coerce'),
+                     'close':pd.to_numeric(data['close'],errors='coerce')})
+    df=df.dropna().sort_values('ts').drop_duplicates('ts')
+    # Exclude today's unfinished UTC daily bar.
+    return df[df.ts+pd.Timedelta(days=1)<=pd.Timestamp.now(tz='UTC')].tail(10).reset_index(drop=True)
 
+def analyze(df):
+    if len(df)<6: return None
+    q=df.usdt.to_numpy(dtype=float)
+    if any(x<0 or not math.isfinite(x) for x in q): return None
+    last3=q[-3:]; previous3=q[-6:-3]
+    avg_now=float(last3.mean()); avg_before=float(previous3.mean())
+    ratio=avg_now/avg_before if avg_before>0 else None
+    # Strong and interpretable rule: each of the last 3 closed days increased.
+    increasing=bool(last3[0]<last3[1]<last3[2])
+    return {'vol_d1':float(q[-1]),'vol_d2':float(q[-2]),'vol_d3':float(q[-3]),
+            'avg3':avg_now,'avg_prev3':avg_before,'growth_pct':(ratio-1)*100 if ratio is not None else None,
+            'increasing':increasing}
 
-@st.cache_data(ttl=900, show_spinner=False)
-def age_from_spot_history(symbol):
-    # 1000 daily candles reaches far enough back to distinguish >=50 days.
-    df = candles(symbol, "1d", 120)
-    if df.empty:
-        return None, "Brak historii"
-    age = (utcnow().date() - df.iloc[0].ts.date()).days
-    if len(df) >= 119:
-        return 50, "50+ (starsza historia; dokładna data nieznana)"
-    return age, f"~{age} dni od pierwszej dostępnej świecy"
-
-
-@st.cache_data(ttl=120, show_spinner=False)
-def futures_candles(contract, interval="Min60", limit=180):
-    """Public contract candles, timestamps in seconds, no spot fallback."""
-    if not contract.endswith("_USDT") or not contract.replace("_", "").isalnum():
-        raise ValueError("Niepoprawny symbol kontraktu")
-    seconds = {"Min15": 900, "Min60": 3600, "Day1": 86400}.get(interval)
-    if seconds is None:
-        raise ValueError("Nieobsługiwany interwał futures")
-    end = int(time.time())
-    start = end - (limit + 3) * seconds
-    payload = get_json(f"/api/v1/contract/kline/{contract}",
-                       {"interval": interval, "start": start, "end": end}, base=FUTURES_BASE)
-    if not isinstance(payload, dict) or not payload.get("success"):
-        raise ValueError(f"Błąd API świec futures: {str(payload.get('code', 'brak kodu'))[:40] if isinstance(payload, dict) else 'format'}")
-    data = payload.get("data")
-    required = ("time", "open", "high", "low", "close", "amount")
-    if not isinstance(data, dict) or any(not isinstance(data.get(k), list) for k in required):
-        raise ValueError("Niepoprawny format świec futures")
-    n = len(data["time"])
-    if not n or any(len(data[k]) != n for k in required):
-        return pd.DataFrame()
-    df = pd.DataFrame({"ts": data["time"], "open": data["open"], "high": data["high"],
-                       "low": data["low"], "close": data["close"], "quote_volume": data["amount"]})
-    for c in ("open", "high", "low", "close", "quote_volume"):
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["ts"] = pd.to_datetime(pd.to_numeric(df.ts, errors="coerce"), unit="s", utc=True)
-    df["close_ts"] = df.ts + pd.Timedelta(seconds=seconds)
-    df = df[(df.close_ts <= pd.Timestamp.now(tz="UTC"))].dropna()
-    return df.sort_values("ts").drop_duplicates("ts").tail(limit).reset_index(drop=True)
-
-
-@st.cache_data(ttl=900, show_spinner=False)
-def age_from_futures_history(contract):
-    # Only approximate: API window is 120 days, not official listing date.
-    df = futures_candles(contract, "Day1", 120)
-    if df.empty:
-        return None, "Brak historii futures"
-    age = (utcnow().date() - df.iloc[0].ts.date()).days
-    if len(df) >= 118:
-        return 50, "50+ dni (historia futures ograniczona do 120 dni)"
-    return age, f"~{age} dni według dostępnych świec futures"
-
-
-def rsi14(close):
-    """Wilder RSI (EMA alpha=1/14), 0..100; insufficient data => NaN."""
-    if len(close) < 30:
-        return float("nan")
-    delta = close.diff()
-    up = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
-    down = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
-    if down.iloc[-1] == 0:
-        return 100.0 if up.iloc[-1] > 0 else 50.0
-    return float(100 - 100 / (1 + up.iloc[-1] / down.iloc[-1]))
-
-
-def compute_signal(symbol, df, fut, cohort, min_turnover, max_spread, max_funding, daily=None):
-    """Early-base watchlist. No momentum-chasing scores or future-return predictions."""
-    if len(df) < 65 or daily is None or len(daily) < 35:
-        return None
-    close = df.close.astype(float)
-    dclose = daily.close.astype(float)
-    price = float(close.iloc[-1])
-    if not np.isfinite(price) or price <= 0:
-        return None
-    bid, ask = safe_float(fut.get("bid1")), safe_float(fut.get("ask1"))
-    spread = (ask / bid - 1) * 100 if bid > 0 and ask >= bid else float("nan")
-    funding, turnover = safe_float(fut.get("fundingRate")), safe_float(fut.get("amount24"))
-    if not all(np.isfinite(x) for x in (spread, funding, turnover)):
-        return None
-    liquidity_reasons = []
-    if turnover < min_turnover: liquidity_reasons.append(f"obrót {turnover:,.0f} USDT < {min_turnover:,.0f}")
-    if spread > max_spread: liquidity_reasons.append(f"spread {spread:.2f}% > {max_spread:.2f}%")
-    if funding * 100 > max_funding: liquidity_reasons.append(f"funding {funding*100:.3f}% > {max_funding:.3f}%")
-    rsi_d = rsi14(dclose)
-    rsi_h = rsi14(close)
-    ema20 = float(dclose.ewm(span=20, adjust=False).mean().iloc[-1])
-    change3 = (float(dclose.iloc[-1] / dclose.iloc[-4]) - 1) * 100
-    change7 = (float(dclose.iloc[-1] / dclose.iloc[-8]) - 1) * 100
-    change24h = (price / float(close.iloc[-25]) - 1) * 100
-    distance_ema = (price / ema20 - 1) * 100
-    high20 = float(df.high.iloc[-21:-1].max())
-    base = df.iloc[-49:-1]
-    base_high, base_low = float(base.high.max()), float(base.low.min())
-    base_width = (base_high / base_low - 1) * 100 if base_low > 0 else float("inf")
-    recent_range = (float(df.high.iloc[-13:-1].max()) / float(df.low.iloc[-13:-1].min()) - 1) * 100
-    previous_range = (float(df.high.iloc[-37:-13].max()) / float(df.low.iloc[-37:-13].min()) - 1) * 100
-    contraction = recent_range < previous_range * 0.8 if previous_range > 0 else False
-    q = df.quote_volume.astype(float)
-    vol_base = float(q.iloc[-25:-1].mean())
-    vol_ratio = float(q.iloc[-1] / vol_base) if vol_base > 0 else float("nan")
-    ema9 = close.ewm(span=9, adjust=False).mean()
-    ema21 = close.ewm(span=21, adjust=False).mean()
-    rising = bool(ema9.iloc[-1] > ema21.iloc[-1] and ema21.iloc[-1] >= ema21.iloc[-5])
-    # Never rank a developed rally as an early-stage setup.
-    gates = []
-    if rsi_h >= 72: gates.append(f"RSI 1H {rsi_h:.1f} ≥ 72")
-    if rsi_d >= 70: gates.append(f"RSI 1D {rsi_d:.1f} ≥ 70")
-    if change24h >= 8: gates.append(f"wzrost 24H +{change24h:.1f}% ≥ 8%")
-    if change3 >= 12: gates.append(f"wzrost 3D +{change3:.1f}% ≥ 12%")
-    if change7 >= 22: gates.append(f"wzrost 7D +{change7:.1f}% ≥ 22%")
-    if distance_ema >= 9: gates.append(f"cena {distance_ema:+.1f}% od EMA20 1D ≥ 9%")
-    if price > high20 * 1.025: gates.append("wybicie >2.5% ponad wcześniejsze maksimum 20H")
-    # Pre-breakout: base under resistance, not a candle already racing away.
-    near_resistance = 0.96 * base_high <= price <= 1.012 * base_high
-    base_ok = base_width <= 14
-    daily_not_weak = 43 <= rsi_d < 70
-    early_volume = np.isfinite(vol_ratio) and 0.65 <= vol_ratio <= 2.5
-    features = {
-        "baza_48h": (base_ok, 25, f"baza 48H {base_width:.1f}% (cel ≤14%)"),
-        "kompresja": (contraction, 20, f"kompresja zmienności 12H/24H: {recent_range:.1f}% / {previous_range:.1f}%"),
-        "blisko_oporu": (near_resistance, 20, f"cena do oporu 48H: {(price/base_high-1)*100:+.1f}%"),
-        "wczesny_trend": (rising, 15, "EMA9 > EMA21 i EMA21 rośnie (1H)"),
-        "RSI_umiarkowane": (daily_not_weak, 10, f"RSI 1D {rsi_d:.1f} w przedziale 43–70"),
-        "wolumen": (early_volume, 10, f"wolumen ostatniej 1H {vol_ratio:.2f}× średniej"),
-    }
-    score = sum(weight for passed, weight, _ in features.values() if passed)
-    positives = [desc for passed, _, desc in features.values() if passed]
-    missing = [desc for passed, _, desc in features.values() if not passed]
-    critical = ["baza_48h", "kompresja", "blisko_oporu", "wczesny_trend", "RSI_umiarkowane"]
-    missing_critical = [k for k in critical if not features[k][0]]
-    if liquidity_reasons:
-        status = "ODRZUCONE — PŁYNNOŚĆ"
-    elif gates:
-        status = "ODRZUCONE — RAJD / PRZEGRZANIE"
-    elif not missing_critical and score >= 75:
-        status = "PRZED WYBICIEM"
-    elif len(missing_critical) <= 2 and score >= 55:
-        status = "BLISKO SETUPU"
-    else:
-        status = "ODRZUCONE — BRAK BAZY"
-    reason_codes = list(liquidity_reasons) + gates + ["brak: " + k for k in missing_critical]
-
-    # A watchlist is not an order signal: no actionable entry, stop or target.
-    return {"symbol": symbol, "contract": str(fut.get("symbol")), "group": cohort,
-            "score": score, "entry_score": score,
-            "trend_score": None, "status": status,
-            "powod": ("BLOKADA: " + "; ".join(liquidity_reasons + gates) + ". " if liquidity_reasons or gates else "") +
-                     "SPEŁNIONE: " + ("; ".join(positives) or "brak") +
-                     ". BRAKUJE: " + ("; ".join(missing) or "nic"),
-            "brakujace_warunki": len(missing_critical), "powody_odrzucenia": "; ".join(reason_codes) or "—",
-            "rsi_1d": round(rsi_d, 1), "rsi_1h": round(rsi_h, 1),
-            "zmiana_24h_pct": round(change24h, 1),
-            "zmiana_3d_pct": round(change3, 1), "zmiana_7d_pct": round(change7, 1),
-            "od_ema20_1d_pct": round(distance_ema, 1), "szerokosc_bazy_48h_pct": round(base_width, 1),
-            "entry": None, "stop": None, "target": None, "spot_close": price,
-            "volume_ratio": vol_ratio, "spread_pct": spread,
-            "funding_pct": funding * 100, "turnover": turnover,
-            "quote_time": utcnow().isoformat()}
-
-
-
-def early_breakout_15m(symbol, df, fut, cohort, min_turnover, max_spread, max_funding, daily=None):
-    """Prospective 15m setup using only CLOSED candles; no look-ahead.
-
-    Score describes a measurable setup, not probability of a future rally.
-    """
-    if len(df) < 85:
-        return None
-    c, h, l, v = (df[k].astype(float) for k in ('close','high','low','quote_volume'))
-    price = float(c.iloc[-1]); previous = float(c.iloc[-2])
-    if price <= 0 or previous <= 0 or (v < 0).any():
-        return None
-    bid, ask = safe_float(fut.get('bid1')), safe_float(fut.get('ask1'))
-    spread = (ask / bid - 1)*100 if bid > 0 and ask >= bid else float('nan')
-    funding, turnover = safe_float(fut.get('fundingRate')), safe_float(fut.get('amount24'))
-    if not all(np.isfinite(x) for x in (spread, funding, turnover)):
-        return None
-    rsi = rsi14(c)
-    ema20 = c.ewm(span=20, adjust=False).mean()
-    ema50 = c.ewm(span=50, adjust=False).mean()
-    # Reference window excludes the most recent candle. Prevents scoring an already finished pump.
-    base = df.iloc[-49:-1]
-    bh, bl = float(base.high.max()), float(base.low.min())
-    width = (bh/bl-1)*100 if bl > 0 else float('inf')
-    old_range = df.iloc[-73:-25]
-    old_width = (float(old_range.high.max())/float(old_range.low.min())-1)*100 if float(old_range.low.min()) > 0 else float('inf')
-    vol_base = float(v.iloc[-49:-1].median())
-    vol_ratio = float(v.iloc[-1]/vol_base) if vol_base > 0 else float('nan')
-    rise_1h = (price/float(c.iloc[-5])-1)*100
-    rise_4h = (price/float(c.iloc[-17])-1)*100
-    rise_24h = (price/float(c.iloc[-97])-1)*100 if len(c)>=97 else float('nan')
-    last_candle = (price/float(df.open.iloc[-1])-1)*100
-    from_low = (price/bl-1)*100 if bl > 0 else float('inf')
-    dist_ema = (price/float(ema20.iloc[-1])-1)*100
-    rsi_d = rsi14(daily.close.astype(float)) if daily is not None and len(daily)>=30 else float('nan')
-    # Hard stops are evaluated BEFORE scoring; do not label already explosive candles as early.
-    blocks = []
-    if turnover < min_turnover: blocks.append('za mały obrót 24h')
-    if spread > max_spread: blocks.append(f'spread {spread:.2f}%')
-    if funding*100 > max_funding: blocks.append(f'funding {funding*100:.3f}%')
-    if rise_1h >= 7: blocks.append(f'już +{rise_1h:.1f}% / 1h')
-    if rise_4h >= 12: blocks.append(f'już +{rise_4h:.1f}% / 4h')
-    if np.isfinite(rise_24h) and rise_24h >= 18: blocks.append(f'już +{rise_24h:.1f}% / 24h')
-    if last_candle >= 4: blocks.append(f'świeca 15m już +{last_candle:.1f}%')
-    if rsi >= 72: blocks.append(f'RSI 15m {rsi:.1f} (przegrzanie)')
-    if np.isfinite(rsi_d) and rsi_d >= 76: blocks.append(f'RSI 1D {rsi_d:.1f}')
-    if dist_ema >= 6: blocks.append(f'cena +{dist_ema:.1f}% ponad EMA20 15m')
-    if price > bh*1.025: blocks.append(f'cena już {(price/bh-1)*100:+.1f}% nad oporem')
-    if width > 30: blocks.append(f'brak stabilnej bazy 12h: {width:.1f}%')
-    # The desired watchlist: quiet base, near its ceiling, not an explosive breakout.
-    tests = [
-      ('wąska baza 12h', width <= 9, 25, f'szerokość {width:.1f}%'),
-      ('kompresja względem wcześniejszych 12h', width < old_width*0.8, 15, f'{width:.1f}% vs {old_width:.1f}%'),
-      ('blisko oporu', bh*0.965 <= price <= bh*1.008, 20, f'odległość {(price/bh-1)*100:+.1f}%'),
-      ('trend nie jest spadkowy', price >= float(ema50.iloc[-1])*0.99, 10, 'cena blisko/powyżej EMA50'),
-      ('RSI bez przegrzania', 42 <= rsi < 65, 10, f'RSI15 {rsi:.1f}'),
-      ('wolumen bez eksplozji', np.isfinite(vol_ratio) and 0.7 <= vol_ratio <= 2.5, 10, f'obrót 15m {vol_ratio:.1f}x mediany'),
-      ('brak silnego rajdu w 4h', -5 <= rise_4h < 5, 10, f'zmiana 4h {rise_4h:+.1f}%'),
-    ]
-    score = sum(w for _, ok, w, _ in tests if ok)
-    failed = [f'{name} ({detail})' for name,ok,_,detail in tests if not ok]
-    passed = [f'{name} ({detail})' for name,ok,_,detail in tests if ok]
-    essential = [tests[i][1] for i in (0,2,4,6)]
-    if blocks: status = 'ODRZUCONE — RAJD / RYZYKO'
-    elif all(essential) and score >= 75: status = 'PRZED WYBICIEM'
-    elif sum(not x for x in essential) <= 2 and score >= 50: status = 'BLISKO SETUPU'
-    else: status = 'ODRZUCONE — BRAK BAZY'
-    return {
-      'symbol': symbol, 'contract': str(fut.get('symbol')), 'group': cohort,
-      'entry_score': score, 'score': score, 'trend_score': None, 'status': status,
-      'powod': ('BLOKADA: '+ '; '.join(blocks)+'. ' if blocks else '') +
-               'TAK: '+('; '.join(passed) or 'brak')+'. BRAK: '+('; '.join(failed) or 'nic'),
-      'brakujace_warunki': sum(not x for x in essential),
-      'powody_odrzucenia': '; '.join(blocks+failed) or '—',
-      'rsi_1h': round(rsi,1), 'rsi_1d': round(rsi_d,1) if np.isfinite(rsi_d) else None,
-      'zmiana_24h_pct': round(rise_24h,1) if np.isfinite(rise_24h) else None,
-      'zmiana_3d_pct': None, 'zmiana_7d_pct': None,
-      'szerokosc_bazy_48h_pct': round(width,1), 'od_ema20_1d_pct': round(dist_ema,1),
-      'opór_15m': round(bh,8), 'od_oporu_pct': round((price/bh-1)*100,2),
-      'zmiana_1h_pct': round(rise_1h,2), 'zmiana_4h_pct': round(rise_4h,2),
-      'wolumen_15m_x': round(vol_ratio,2) if np.isfinite(vol_ratio) else None,
-      'ostatnia_swieca_15m_utc': str(df.iloc[-1].close_ts),
-      'entry': None, 'stop': None, 'target': None, 'spot_close': price,
-      'volume_ratio': vol_ratio, 'spread_pct': spread, 'funding_pct': funding*100,
-      'turnover': turnover, 'quote_time': utcnow().isoformat()
-    }
-
-def db_connect():
-    con = sqlite3.connect(DB, timeout=8)
-    con.execute("""CREATE TABLE IF NOT EXISTS paper (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, created TEXT NOT NULL, symbol TEXT NOT NULL,
-        contract TEXT NOT NULL, cohort TEXT NOT NULL, entry REAL NOT NULL,
-        stop REAL NOT NULL, target REAL NOT NULL, quantity REAL NOT NULL,
-        fee_pct REAL NOT NULL, slippage_pct REAL NOT NULL, status TEXT NOT NULL,
-        exit_price REAL, closed TEXT, pnl REAL, reason TEXT)""")
-    # Existing positions were opened using spot-based analysis: never silently migrate them.
-    cols = {row[1] for row in con.execute("PRAGMA table_info(paper)")}
-    if "data_source" not in cols:
-        con.execute("ALTER TABLE paper ADD COLUMN data_source TEXT NOT NULL DEFAULT 'spot_legacy'")
-    con.commit()
-    return con
-
-
-def paper_open(row, capital, risk_pct, fee_pct, slippage_pct):
-    ask = float(row["entry"])
-    entry = ask * (1 + slippage_pct / 100)
-    stop = float(row["stop"])
-    if stop <= 0 or entry <= stop:
-        raise ValueError("Niepoprawny stop-loss")
-    # Risk includes entry fee and an adverse stop exit with fee and slippage.
-    stop_exit = stop * (1 - slippage_pct / 100)
-    loss_per_unit = (entry - stop_exit) + (entry + stop_exit) * fee_pct / 100
-    if loss_per_unit <= 0:
-        raise ValueError("Niepoprawny budżet ryzyka")
-    risk_budget = capital * risk_pct / 100
-    qty = min(risk_budget / loss_per_unit, capital / (entry * (1 + fee_pct / 100)))
-    if not math.isfinite(qty) or qty <= 0:
-        raise ValueError("Niepoprawna wielkość pozycji")
-    con = db_connect()
+st.title('🌱 MEXC — nowe kryptowaluty z rosnącym wolumenem')
+st.caption('Tylko kontrakty futures USDT. Wiek 3–77 dni (11 tygodni), obrót 24h ≥ 300 000 USDT, narastający wolumen z 3 zakończonych dni UTC. Bez składania zleceń.')
+st.info('Wiek liczony od daty uruchomienia kontraktu futures, jeśli MEXC ją publikuje. Kontrakty bez wiarygodnej daty nie są zgadywane ani wyświetlane jako spełniające filtr.')
+with st.expander('Jak działa filtr rosnącego wolumenu?',expanded=False):
+    st.write('Wolumen obrotu w USDT musi rosnąć każdego z trzech ostatnich zakończonych dni: dzień −3 < dzień −2 < dzień −1. Dodatkowo średni dzienny obrót z tych 3 dni musi być wyższy niż z poprzednich 3 dni. Minimum 300 000 USDT dotyczy bieżącego obrotu z ostatnich 24 godzin (rolling 24h).')
+max_requests=st.slider('Maksymalna liczba kontraktów do sprawdzenia świec',20,300,150,20,
+                       help='Większy limit zwiększa pokrycie, ale także czas skanowania i ryzyko limitów API.')
+if st.button('🔎 Skanuj nowe kryptowaluty',type='primary'):
     try:
-        exists = con.execute("SELECT COUNT(*) FROM paper WHERE contract=? AND status='OPEN'", (row["contract"],)).fetchone()[0]
-        if exists:
-            raise ValueError("Istnieje już otwarta symulacja tego kontraktu")
-        con.execute("""INSERT INTO paper(created,symbol,contract,cohort,entry,stop,target,quantity,fee_pct,slippage_pct,status,data_source)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (utcnow().isoformat(), row["symbol"], row["contract"],
-                        row["group"], entry, stop, row["target"], qty, fee_pct, slippage_pct, "OPEN", "futures"))
-        con.commit()
-    finally:
-        con.close()
-
-
-def paper_update():
-    """Closed futures candles; conservative SL when TP and SL share a bar."""
-    con = db_connect()
-    errors = []
-    try:
-        rows = con.execute("""SELECT id,created,contract,entry,stop,target,quantity,fee_pct,slippage_pct
-                              FROM paper WHERE status='OPEN' AND data_source='futures'""").fetchall()
-        for rid, created, contract, entry, stop, target, qty, fee, slip in rows:
+        details,tickers=universe()
+        now=datetime.now(timezone.utc)
+        ticker_map={t.get('symbol'):t for t in tickers if isinstance(t,dict)}
+        eligible=[]; counts={'Wszystkie kontrakty':len(details),'Brak daty notowania':0,'Poza wiekiem 3–77 dni':0,
+                             'Poza futures USDT':0,'Obrót 24h poniżej 300 000 USDT / brak danych':0,
+                             'Odrzucone: zbyt krótka historia wolumenu':0,'Odrzucone: wolumen nie narasta':0,
+                             'Błędy pobierania świec':0,'Spełniające wszystkie warunki':0}
+        for d in details:
+            if not isinstance(d,dict):continue
+            sym=d.get('symbol','')
+            if not isinstance(sym,str) or not sym.endswith('_USDT'):
+                counts['Poza futures USDT']+=1;continue
+            date,key=listing_date(d)
+            if date is None:
+                counts['Brak daty notowania']+=1;continue
+            age=(now-date).total_seconds()/86400
+            if not MIN_DAYS<=age<=MAX_DAYS:
+                counts['Poza wiekiem 3–77 dni']+=1;continue
+            t=ticker_map.get(sym,{})
+            turnover=number(t.get('amount24'))
+            if turnover is None or turnover<MIN_USDT:
+                counts['Obrót 24h poniżej 300 000 USDT / brak danych']+=1;continue
+            eligible.append((sym,age,date,turnover,t))
+        eligible.sort(key=lambda r:r[3],reverse=True)
+        checked=eligible[:max_requests]
+        rows=[];errors=[]
+        progress=st.progress(0)
+        for i,(sym,age,date,turnover,t) in enumerate(checked):
             try:
-                start = pd.Timestamp(created)
-                expiry = start + pd.Timedelta(hours=24)
-                df = futures_candles(contract, "Min60", 60)
-                if df.empty:
-                    errors.append(f"{contract}: brak zamkniętych świec futures")
-                    continue
-                # Exclude the partially observed entry hour to avoid look-ahead.
-                subset = df[df.ts >= start]
-                if subset.empty:
-                    continue
-                reason = None
-                exit_price = None
-                exit_time = None
-                for _, bar in subset.iterrows():
-                    if bar.ts >= expiry:
-                        break
-                    if bar.low <= stop:
-                        reason, exit_price = "SL (lub SL i TP w jednej świecy)", stop
-                    elif bar.high >= target:
-                        reason, exit_price = "TP", target
-                    if reason:
-                        exit_time = bar.close_ts
-                        break
-                if reason is None:
-                    expired = subset[subset.close_ts >= expiry]
-                    if not expired.empty:
-                        last = expired.iloc[0]
-                        reason, exit_price, exit_time = "24h", float(last.close), last.close_ts
-                if reason is None:
-                    continue
-                exit_net = exit_price * (1 - slip / 100)
-                pnl = (exit_net - entry) * qty - (entry + exit_net) * qty * fee / 100
-                con.execute("UPDATE paper SET status='CLOSED',exit_price=?,closed=?,pnl=?,reason=? WHERE id=?",
-                            (exit_net, exit_time.isoformat(), pnl, reason, rid))
-            except Exception as e:
-                errors.append(f"{contract}: {type(e).__name__}: {str(e)[:120]}")
-        con.commit()
-    finally:
-        con.close()
-    return errors
+                df=daily(sym)
+                metric=analyze(df)
+                if metric is None:
+                    counts['Odrzucone: zbyt krótka historia wolumenu']+=1
+                elif not metric['increasing'] or metric['avg3']<=metric['avg_prev3']:
+                    counts['Odrzucone: wolumen nie narasta']+=1
+                else:
+                    rows.append({'Symbol':sym.replace('_',''),'Wiek (dni)':int(age),
+                                 'Data futures (UTC)':date.strftime('%Y-%m-%d'),
+                                 'Obrót 24h (USDT)':round(turnover),
+                                 'Wolumen dzień -3 (USDT)':round(metric['vol_d3']),
+                                 'Wolumen dzień -2 (USDT)':round(metric['vol_d2']),
+                                 'Wolumen dzień -1 (USDT)':round(metric['vol_d1']),
+                                 'Wzrost średniego wolumenu 3d vs poprzednie 3d (%)':round(metric['growth_pct'],1),
+                                 'Cena':number(t.get('lastPrice')),
+                                 'Dlaczego':'3 kolejne dni wzrostu wolumenu; średnia 3d > poprzednie 3d; obrót 24h ≥ 300 tys. USDT'})
+            except Exception as exc:
+                counts['Błędy pobierania świec']+=1
+                errors.append(f'{sym}: {str(exc)[:110]}')
+                if 'HTTP 429' in str(exc) or 'HTTP 418' in str(exc) or 'HTTP 403' in str(exc):
+                    st.warning('API ograniczyło dostęp; przerwano skanowanie, wynik jest niepełny.')
+                    break
+            progress.progress((i+1)/max(1,len(checked)))
+        counts['Spełniające wszystkie warunki']=len(rows)
+        st.session_state['last_scan']={'rows':rows,'counts':counts,'eligible':len(eligible),
+                                      'checked':len(checked),'errors':errors,'time':now.strftime('%Y-%m-%d %H:%M UTC')}
+    except Exception as exc:
+        st.error(f'Nie udało się pobrać danych z MEXC: {str(exc)[:350]}')
 
-
-st.title("📡 MEXC Breakout Radar v2.0.8")
-st.caption("Badanie setupów futures LONG • osobne grupy 3–49 i 50+ dni • symulacje i alerty w aplikacji • bez zleceń")
-st.warning("Wersja eksperymentalna: szuka konsolidacji przed możliwym wybiciem, nie przewiduje rajdów. Brak sygnałów wejścia i nowych symulacji z listy. Bez zleceń.")
-
-with st.sidebar:
-    st.header("⚙️ Ustawienia")
-    limit = st.slider("Liczba kontraktów do sprawdzenia", 10, 150, 40, 10)
-    min_turnover = st.number_input("Min. obrót futures 24h (USDT)", min_value=0.0, value=1_000_000.0, step=250_000.0)
-    max_spread = st.slider("Maksymalny spread (%)", 0.05, 2.0, 0.5, 0.05)
-    max_funding = st.slider("Maksymalny funding dodatni (%)", 0.0, 0.5, 0.1, 0.01)
-    min_score = st.slider("Minimalna ocena bazy do listy obserwacyjnej", 0, 100, 65, 5)
-    capital = st.number_input("Kapitał symulacyjny (USDT)", 100.0, 1_000_000.0, 1000.0, 100.0)
-    risk_pct = st.slider("Ryzyko na pozycję (% kapitału)", 0.1, 2.0, 0.5, 0.1)
-    fee_pct = st.number_input("Prowizja za jedną stronę (%)", 0.0, 1.0, 0.05, 0.01)
-    slip_pct = st.number_input("Szacowany poślizg na stronę (%)", 0.0, 2.0, 0.1, 0.05)
-    scan = st.button("🔎 Skanuj futures LONG", type="primary", use_container_width=True)
-
-scan_tab, manual_tab, paper_tab, traders_tab, about_tab = st.tabs(["🔎 Dwa skanery", "🧪 Analiza ręczna", "📒 Symulacje i alerty", "🏆 Traderzy futures", "ℹ️ Metodologia"])
-
-with scan_tab:
-    st.subheader("Radar PRZED wybiciem — zamknięte świece 15m")
-    st.caption("Baza 12h + opór + umiarkowany RSI 15m. Rajdy już rozpoczęte są blokowane. Analiza wyłącznie po zamknięciu świecy; aktualizacja po ponownym skanie. Progi eksperymentalne.")
-    if scan:
-        st.session_state["classified"] = []
-        st.session_state["counters"] = {}
-        st.session_state["errors"] = []
-        st.session_state["results"] = []
-        st.session_state["scan_blocked"] = None
-        try:
-            raw = futures_tickers()
-            futs = []
-            for f in raw:
-                name = str(f.get("symbol", ""))
-                turnover = safe_float(f.get("amount24"))
-                # Exclude stocks, leveraged ETFs, commodities and index proxies; ticker alone
-                # cannot classify every synthetic instrument, so also reject known families.
-                base_asset = name[:-5] if name.endswith("_USDT") else ""
-                banned = ("SOXS", "SOXL", "USOIL", "XAU", "XAG", "SILVER", "GOLD", "MUSTOCK", "TSLA", "NVDA", "AAPL", "SPY", "QQQ", "STOCK", "OIL")
-                if (name.endswith("_USDT") and not any(x in base_asset for x in banned)
-                        and np.isfinite(turnover) and turnover >= min_turnover):
-                    futs.append((turnover, f))
-            futs.sort(key=lambda x: x[0], reverse=True)
-            futs = futs[:limit]
-            classified = []
-            errors = []
-            blocked = None
-            counters = {"przed": 0, "blisko": 0, "rajd": 0, "plynnosc": 0, "brak_bazy": 0,
-                        "brak_historii": 0, "brak_wskaznikow": 0}
-            bar = st.progress(0)
-            for i, (_, f) in enumerate(futs):
-                symbol = str(f["symbol"]).replace("_", "")
-                try:
-                    age, age_note = age_from_futures_history(str(f["symbol"]))
-                    if age is None or age < 3:
-                        counters["brak_historii"] += 1
-                        continue
-                    cohort = "3–49 dni" if age <= 49 else "50+ dni"
-                    df = futures_candles(str(f["symbol"]), "Min15", 110)
-                    daily = futures_candles(str(f["symbol"]), "Day1", 85)
-                    result = early_breakout_15m(symbol, df, f, cohort, min_turnover, max_spread, max_funding, daily=daily)
-                    if result is None:
-                        counters["brak_wskaznikow"] += 1
-                        continue
-                    result["wiek_danych"] = age_note
-                    classified.append(result)
-                    status = result["status"]
-                    if status == "PRZED WYBICIEM": counters["przed"] += 1
-                    elif status == "BLISKO SETUPU": counters["blisko"] += 1
-                    elif "RAJD" in status: counters["rajd"] += 1
-                    elif "PŁYNNOŚĆ" in status: counters["plynnosc"] += 1
-                    else: counters["brak_bazy"] += 1
-                except MarketDataHTTPError as e:
-                    errors.append(f"{symbol}: {e}")
-                    if e.status in (403, 418, 429, 451):
-                        blocked = str(e)
-                        break
-                except Exception as e:
-                    errors.append(f"{symbol}: {type(e).__name__}: {str(e)[:160]}")
-                finally:
-                    bar.progress((i + 1) / max(1, len(futs)))
-            bar.empty()
-            st.session_state["classified"] = classified
-            st.session_state["counters"] = counters
-            st.session_state["errors"] = errors
-            st.session_state["scan_blocked"] = blocked
-            if blocked:
-                st.error("DANE NIEDOSTĘPNE — skan przerwany. " + blocked)
-            st.info(f"Wybrano {len(futs)} kontraktów według obrotu. Przeanalizowano: {len(classified)}. "
-                    f"Przed wybiciem: {counters['przed']}; blisko setupu: {counters['blisko']}; "
-                    f"odrzucone: {counters['rajd']+counters['plynnosc']+counters['brak_bazy']}. "
-                    f"Błędy API: {len(errors)}. Świece futures.")
-            if errors:
-                st.warning("Nie wszystkie kontrakty udało się przeanalizować. Brak kandydatów nie oznacza pełnego skanu rynku.")
-            if errors:
-                with st.expander("Błędy pobierania danych"):
-                    st.write(errors[:25])
-        except Exception as e:
-            st.session_state["classified"] = []
-            st.session_state["counters"] = {}
-            st.session_state["scan_blocked"] = str(e)
-            st.error(f"DANE NIEDOSTĘPNE — skanowanie nie powiodło się: {e}")
-    classified = st.session_state.get("classified", [])
-    counters = st.session_state.get("counters", {})
-    if counters:
-        st.markdown("### 🔍 Diagnostyka filtrów")
-        st.dataframe(pd.DataFrame([
-            {"Filtr / wynik": "PRZED WYBICIEM", "Liczba": counters.get("przed", 0)},
-            {"Filtr / wynik": "BLISKO SETUPU", "Liczba": counters.get("blisko", 0)},
-            {"Filtr / wynik": "Rajd / przegrzanie", "Liczba": counters.get("rajd", 0)},
-            {"Filtr / wynik": "Płynność / spread / funding", "Liczba": counters.get("plynnosc", 0)},
-            {"Filtr / wynik": "Brak bazy / warunków", "Liczba": counters.get("brak_bazy", 0)},
-            {"Filtr / wynik": "Za krótka historia / <3 dni", "Liczba": counters.get("brak_historii", 0)},
-            {"Filtr / wynik": "Brak wymaganych wskaźników", "Liczba": counters.get("brak_wskaznikow", 0)},
-            {"Filtr / wynik": "Błędy API", "Liczba": len(st.session_state.get("errors", []))},
-        ]), hide_index=True, use_container_width=True)
-        st.caption("Kategorie rozłączne: każdy kontrakt trafia do pierwszej właściwej kategorii. Odrzucone instrumenty pozostają widoczne tylko w diagnostyce.")
-    cols = ["symbol", "entry_score", "status", "powod", "brakujace_warunki", "rsi_1h", "zmiana_1h_pct", "zmiana_4h_pct", "zmiana_24h_pct", "szerokosc_bazy_48h_pct", "opór_15m", "od_oporu_pct", "wolumen_15m_x", "ostatnia_swieca_15m_utc", "wiek_danych"]
-    for cohort in ["3–49 dni", "50+ dni"]:
-        st.markdown(f"### {'🆕' if cohort.startswith('3') else '🏛️'} {cohort}")
-        group = [x for x in classified if x["group"] == cohort]
-        for status, heading in [("PRZED WYBICIEM", "🟢 PRZED WYBICIEM"), ("BLISKO SETUPU", "🟡 BLISKO SETUPU")]:
-            st.markdown(f"**{heading}**")
-            rows = sorted([x for x in group if x["status"] == status and (status != "PRZED WYBICIEM" or x["score"] >= min_score)], key=lambda x: (-x["score"], x["brakujace_warunki"]))
-            if rows:
-                st.dataframe(pd.DataFrame(rows)[cols], use_container_width=True, hide_index=True)
-                st.download_button(f"Pobierz CSV {heading} {cohort}", pd.DataFrame(rows).to_csv(index=False), f"radar_{status.replace(' ', '_')}_{cohort.replace(' ','_')}.csv", "text/csv", key=f"csv_{status}_{cohort}")
-            else:
-                st.info("Brak instrumentów w tej kategorii.")
-        rejected = [x for x in group if x["status"].startswith("ODRZUCONE")]
-        with st.expander(f"🔴 ODRZUCONE — diagnostyka ({len(rejected)})"):
-            if rejected:
-                st.dataframe(pd.DataFrame(rejected)[cols], use_container_width=True, hide_index=True)
-                st.download_button(f"Pobierz odrzucone CSV {cohort}", pd.DataFrame(rejected).to_csv(index=False), f"odrzucone_{cohort.replace(' ','_')}.csv", "text/csv", key=f"rej_{cohort}")
-            else:
-                st.caption("Brak odrzuconych z dostępnymi wskaźnikami.")
-    st.caption("15m = zamknięte świece, skan ręczny, brak alertów w czasie rzeczywistym. Nie przewiduje przyszłego rajdu. Żadna kategoria nie stanowi rekomendacji transakcji.")
-
-with manual_tab:
-    symbol = st.text_input("Para spot, np. TIAUSDT", value="TIAUSDT").strip().upper()
-    if st.button("Analizuj parę"):
-        try:
-            age, note = age_from_spot_history(symbol)
-            df = candles(symbol, "1h", 160)
-            st.write("Historia:", note)
-            if len(df) >= 26:
-                st.line_chart(df.set_index("ts")["close"])
-                st.metric("Ostatnia zamknięta świeca 1h", f"{df.close.iloc[-1]:.8g} USDT")
-                st.metric("Wolumen ostatniej zamkniętej świecy (USDT)", f"{df.quote_volume.iloc[-1]:,.0f}")
-            else:
-                st.warning("Za mało zamkniętych świec 1h")
-            st.caption("Analiza spot nie oznacza, że istnieje aktywny kontrakt futures dla tej pary.")
-        except Exception as e:
-            st.error(f"Błąd analizy: {e}")
-
-with paper_tab:
-    st.subheader("📒 Dziennik symulowanych pozycji")
-    st.caption("Wyniki aktualizują się po naciśnięciu przycisku. Na Streamlit Community Cloud lokalna baza może zniknąć po restarcie lub redeployu.")
-    if st.button("🔄 Aktualizuj wyniki i alerty"):
-        update_errors = paper_update()
-        if update_errors:
-            st.warning("Nie wszystkie symulacje można zaktualizować.")
-            with st.expander("Błędy aktualizacji"):
-                st.write(update_errors[:20])
-    con = db_connect()
-    try:
-        trades = pd.read_sql_query("SELECT * FROM paper ORDER BY id DESC", con)
-    finally:
-        con.close()
-    if trades.empty:
-        st.info("Brak symulacji. Uruchom skaner i wybierz setup do obserwacji.")
+if 'last_scan' in st.session_state:
+    result=st.session_state['last_scan']
+    st.subheader('Kryptowaluty spełniające wszystkie warunki')
+    st.caption(f"Skan: {result['time']}. Kandydaci po wieku i obrocie: {result['eligible']}. Sprawdzono świece: {result['checked']}.")
+    if result['checked']<result['eligible']:
+        st.warning(f"Wynik niepełny: limit skanowania. Pominięto {result['eligible']-result['checked']} kwalifikujących się kontraktów.")
+    if result['rows']:
+        table=pd.DataFrame(result['rows']).sort_values('Wzrost średniego wolumenu 3d vs poprzednie 3d (%)',ascending=False)
+        st.dataframe(table,use_container_width=True,hide_index=True)
+        st.download_button('⬇️ Pobierz CSV',table.to_csv(index=False).encode('utf-8-sig'),file_name='mexc_nowe_rosnacy_wolumen.csv',mime='text/csv')
     else:
-        if ((trades.status == "OPEN") & (trades.data_source == "spot_legacy")).any():
-            st.warning("Starsze symulacje spot pozostają w dzienniku, ale nie będą automatycznie rozliczane na świecach futures. Eksportuj je do CSV.")
-        st.dataframe(trades, use_container_width=True, hide_index=True)
-        closed = trades[trades.status == "CLOSED"]
-        a, b, c = st.columns(3)
-        a.metric("Zamknięte symulacje", len(closed))
-        b.metric("Łączny wynik netto (USDT)", f"{closed.pnl.sum():.2f}")
-        c.metric("Udział zyskownych", f"{100*(closed.pnl > 0).mean():.1f}%" if len(closed) else "—")
-        st.download_button("⬇️ Eksport dziennika CSV", trades.to_csv(index=False), "radar_paper_trades.csv", "text/csv")
-        opened = trades[trades.status == "OPEN"]
-        if not opened.empty:
-            st.warning(f"🔔 Alert w aplikacji: {len(opened)} otwartych symulacji do monitorowania. Powiadomienia push 24/7 nie są jeszcze aktywne.")
+        st.info('Brak kontraktów spełniających wszystkie filtry w sprawdzonym zakresie. To nie oznacza, że na całej giełdzie nie ma takich kontraktów.')
+    st.subheader('Diagnostyka — dlaczego odpadają kontrakty')
+    st.dataframe(pd.DataFrame([{'Filtr':k,'Liczba':v} for k,v in result['counts'].items()]),hide_index=True,use_container_width=True)
+    if result['errors']:
+        with st.expander(f"Błędy świec ({len(result['errors'])})"):
+            st.code('\n'.join(result['errors'][:30]))
 
-with traders_tab:
-    st.subheader("🏆 Publiczni traderzy futures — lista obserwacyjna")
-    st.warning("To nie są zweryfikowane konta o trwałej przewadze. Dane publiczne bywają opóźnione, a wysoki ROI lub win rate nie oznacza niskiego ryzyka. Bez automatycznego kopiowania transakcji.")
-    st.markdown("[Otwórz ranking MEXC Copy Trading](https://www.mexc.com/futures/copyTrade/home) · [Porównaj traderów na MEXC](https://www.mexc.com/futures/copyTrade/leaderVS)")
-    st.caption("Na giełdzie scentralizowanej publiczny profil tradera nie jest jego adresem portfela on-chain. Nie przypisujemy anonimowym adresom niepotwierdzonych wyników.")
-    st.markdown("**Przykładowy publiczny profil do sprawdzenia — nie rekomendacja:** [MEXC DD0516](https://www.mexc.com/futures/copyTrade/leader/DD0516). Sprawdź aktualne wyniki na giełdzie; nie są pobierane automatycznie.")
-    st.markdown("#### Własna lista profili i porównanie wyników")
-    st.caption("Wpisz dane widoczne na profilu tradera (najlepiej 90–180 dni). Puste lub niepełne dane nie otrzymują wysokiej oceny. Dane przechowywane tylko w bieżącej sesji Streamlit — pobierz CSV, aby ich nie stracić.")
-    if "trader_watch" not in st.session_state:
-        st.session_state.trader_watch = []
-    with st.form("trader_add", clear_on_submit=True):
-        name = st.text_input("Nazwa publiczna / identyfikator profilu")
-        url = st.text_input("Pełny link do profilu MEXC", placeholder="https://www.mexc.com/futures/copyTrade/leader/...")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            days = st.number_input("Okres oceny (dni)", 0, 365, 90, 1)
-            trades_n = st.number_input("Liczba zamkniętych transakcji", 0, 100000, 0, 1)
-        with c2:
-            pnl = st.number_input("PNL (USDT) w okresie", value=0.0, step=100.0)
-            roi = st.number_input("ROI (%) w okresie", value=0.0, step=1.0)
-        with c3:
-            win = st.number_input("Wygrane (%)", 0.0, 100.0, 0.0, 1.0)
-            dd = st.number_input("Maks. obsunięcie (%) — 0 jeśli nieznane", 0.0, 100.0, 0.0, 1.0)
-        notes = st.text_input("Uwagi / źródło danych / data odczytu")
-        submitted = st.form_submit_button("➕ Dodaj do obserwowanych")
-    if submitted:
-        if not name.strip() or not (url.startswith("https://www.mexc.com/futures/copyTrade/leader/") or url.startswith("https://www.mexc.co/futures/copyTrade/leader/")):
-            st.error("Podaj nazwę i poprawny publiczny link profilu MEXC (ścieżka /futures/copyTrade/leader/...).")
-        else:
-            enough = days >= 90 and trades_n >= 30 and dd > 0
-            if not enough:
-                verdict = "NIEZWERYFIKOWANY — za krótki okres, za mało transakcji lub brak drawdown"
-                quality = None
-            elif pnl <= 0 or roi <= 0 or dd >= 35:
-                verdict = "WYSOKIE RYZYKO / BRAK POTWIERDZONEJ RENTOWNOŚCI"
-                quality = 0
-            else:
-                quality = round(max(0, min(100, 45 + min(15, trades_n / 20) + min(15, days / 12) + min(10, win / 10) - dd * 1.2)))
-                verdict = "DO DALSZEJ WERYFIKACJI" if quality >= 65 else "OSTROŻNIE — SŁABE PARAMETRY"
-            st.session_state.trader_watch.append({"profil": name.strip(), "url": url.strip(), "dni": days, "transakcje": trades_n, "PNL_USDT": pnl, "ROI_pct": roi, "win_rate_pct": win, "max_drawdown_pct": dd if dd else None, "ocena_wstepna": quality, "status": verdict, "uwagi": notes, "odczyt_UTC": utcnow().isoformat(timespec="minutes")})
-            st.success("Dodano do listy obserwacyjnej. Ocena jest heurystyczna, nie rankingiem potwierdzonych zwycięzców.")
-    if st.session_state.trader_watch:
-        df_traders = pd.DataFrame(st.session_state.trader_watch)
-        st.dataframe(df_traders, use_container_width=True, hide_index=True, column_config={"url": st.column_config.LinkColumn("Profil MEXC")})
-        st.download_button("⬇️ Eksport profili CSV", df_traders.to_csv(index=False).encode("utf-8-sig"), "mexc_trader_watchlist.csv", "text/csv")
-        if st.button("🗑️ Wyczyść listę sesji"):
-            st.session_state.trader_watch = []
-            st.rerun()
-    else:
-        st.info("Lista jest pusta. Otwórz ranking MEXC, wybierz publiczny profil i wpisz dane z jego statystyk.")
-    st.caption("Ocena wstępna nie uwzględnia dźwigni, ryzyka likwidacji, wielkości kapitału ani survivorship bias. Sam win rate nie wystarcza. Żadnych kluczy API, zleceń ani kopiowania pozycji.")
-
-with about_tab:
-    st.markdown("""**Ograniczenia v2.0**\n\n- Brak prawdziwych zleceń i brak kluczy prywatnych.\n- Cena wejścia pochodzi z orientacyjnego ask futures, a nowe symulacje sprawdzają SL/TP na **zamkniętych świecach futures**. To nadal nie jest wierny backtest wykonania zleceń.\n- Ryzyko nowej symulacji uwzględnia założone prowizje i poślizg przy SL, ale nie gwarantuje limitu straty; funding, luki i likwidacja nie są księgowane.\n- Przebieg ceny wewnątrz świecy jest nieznany; przy jednoczesnym SL i TP zakładamy najgorszy przypadek.\n- Wiek kontraktu jest oszacowany na podstawie ograniczonej historii świec futures, nie oficjalnej daty listingu.\n- Skan obejmuje wybrane kontrakty o największym obrocie, a nie cały rynek.\n- Brak samodzielnych alertów w tle. Streamlit Community Cloud nie jest trwałą bazą danych.\n- Score nie jest skalibrowanym prawdopodobieństwem zysku. Wyniki symulacji nie dowodzą przewagi rynkowej.\n\n**Następny etap:** osobny worker 24/7, trwała baza, funding i rygorystyczne testy historyczne.""")
+st.caption('Wzrost wolumenu nie gwarantuje wzrostu ceny. Dane z publicznego API MEXC; żadnych kluczy API, zleceń ani automatycznego handlu.')
